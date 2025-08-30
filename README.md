@@ -7,6 +7,7 @@ A web application for migrating issues between GitHub and GitLab platforms.
 - Fetch issues from GitHub repositories or GitLab projects
 - Select specific issues to migrate
 - Migrate issues with descriptions, labels, and comments
+- **Image Migration**: Automatically downloads and re-uploads images when migrating to GitLab
 - Support for both GitHub to GitLab and GitLab to GitHub migrations
 - Track migration progress and results
 

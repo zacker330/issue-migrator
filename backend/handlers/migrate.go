@@ -3,7 +3,10 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -13,7 +16,11 @@ import (
 )
 
 func MigrateIssues(c *gin.Context) {
+	// Force flush output
+	slog.Info("xxxx22222222xxxxx")
 	var req models.MigrationRequest
+	fmt.Fprintf(os.Stderr, "--------------------\n")
+	log.Println("MigrateIssues called")
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

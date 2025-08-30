@@ -15,8 +15,15 @@ RUN apk --no-cache add ca-certificates
 WORKDIR /root/
 
 COPY --from=builder /app/issue-migrator .
-COPY --from=builder /app/.env.example .env
+# Create empty .env file if .env.example doesn't exist
+RUN touch .env
 
 EXPOSE 8080
 
+# Set environment variable to disable output buffering
+ENV GODEBUG=gctrace=0
+ENV GIN_MODE=release
+ENV DOCKER_CONTAINER=true
+
+# Run with unbuffered output
 CMD ["./issue-migrator"]

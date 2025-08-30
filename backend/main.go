@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"fmt"
 	"os"
 
 	"github.com/gin-contrib/cors"
@@ -11,10 +11,13 @@ import (
 )
 
 func main() {
+
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found")
+		fmt.Println("[INFO] No .env file found")
 	}
 
+	// Keep Gin in debug mode to see all logs
+	// gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
 	config := cors.DefaultConfig()
@@ -28,16 +31,16 @@ func main() {
 		api.GET("/health", handlers.HealthCheck)
 		api.POST("/github/issues", handlers.GetGitHubIssues)
 		api.POST("/gitlab/issues", handlers.GetGitLabIssues)
-		api.POST("/migrate", handlers.MigrateIssues)
+		api.POST("/migrate", handlers.MigrateIssuesFinal) // Final version with logging
 	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-
-	log.Printf("Server starting on port %s", port)
+	fmt.Printf("[SERVER] Starting on port %s\n", port)
 	if err := r.Run(":" + port); err != nil {
-		log.Fatal("Failed to start server:", err)
+		fmt.Printf("[ERROR] Failed to start server: %v\n", err)
+		os.Exit(1)
 	}
 }

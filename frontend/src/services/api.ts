@@ -43,6 +43,7 @@ export const migrateIssues = async (request: MigrateRequest): Promise<MigrationR
     issue_ids: request.issueIds,
   };
 
+  // Use main endpoint with image handling
   const response = await axios.post(`${API_BASE_URL}/migrate`, payload);
   return response.data;
 };
