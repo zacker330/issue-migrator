@@ -32,6 +32,7 @@ function App() {
   const [selectedIssues, setSelectedIssues] = useState<number[]>([]);
   const [migrationResult, setMigrationResult] = useState<MigrationResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState<string>('configure');
 
   const handleFetchIssues = async () => {
     setLoading(true);
@@ -43,6 +44,8 @@ function App() {
         issues = await fetchGitLabIssues(sourceConfig);
       }
       setSourceIssues(issues);
+      // Automatically switch to issues tab after successful fetch
+      setActiveTab('issues');
     } catch (error) {
       console.error('Failed to fetch issues:', error);
       alert('Failed to fetch issues. Please check your configuration.');
@@ -79,7 +82,7 @@ function App() {
       <h1 className="mb-4">Issue Migrator</h1>
       <p className="lead mb-4">Migrate issues between GitHub and GitLab platforms</p>
 
-      <Tabs defaultActiveKey="configure" className="mb-4">
+      <Tabs activeKey={activeTab} onSelect={(k) => k && setActiveTab(k)} className="mb-4">
         <Tab eventKey="configure" title="Configure">
           <div className="row">
             <div className="col-md-6">
