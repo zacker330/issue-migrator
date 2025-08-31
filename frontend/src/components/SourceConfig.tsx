@@ -95,6 +95,21 @@ const SourceConfig: React.FC<SourceConfigProps> = ({
         </Form.Text>
       </Form.Group>
 
+      {config.type === 'github' && (
+        <Form.Group className="mb-3">
+          <Form.Label>Session Cookie (Optional)</Form.Label>
+          <Form.Control
+            type="password"
+            placeholder="user_session cookie value"
+            value={config.session || ''}
+            onChange={(e) => handleChange('session', e.target.value)}
+          />
+          <Form.Text className="text-muted">
+            GitHub session cookie for file uploads (found in browser DevTools → Application → Cookies → user_session)
+          </Form.Text>
+        </Form.Group>
+      )}
+
       {!isTarget && (
         <Button
           variant="primary"

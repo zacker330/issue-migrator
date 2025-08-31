@@ -31,6 +31,7 @@ export const migrateIssues = async (request: MigrateRequest): Promise<MigrationR
       project_id: request.source.projectId,
       base_url: request.source.baseUrl,
       token: request.source.token,
+      session: request.source.session || '',
     },
     target: {
       type: request.target.type,
@@ -39,6 +40,7 @@ export const migrateIssues = async (request: MigrateRequest): Promise<MigrationR
       project_id: request.target.projectId,
       base_url: request.target.baseUrl,
       token: request.target.token,
+      session: request.target.session || '',
     },
     issue_ids: request.issueIds,
   };

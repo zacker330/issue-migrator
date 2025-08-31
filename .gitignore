@@ -1,4 +1,5 @@
 # Backend
+backend/backend
 /backend/issue-migrator
 /backend/.env
 /backend/*.exe

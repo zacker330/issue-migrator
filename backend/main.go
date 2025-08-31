@@ -31,7 +31,7 @@ func main() {
 		api.GET("/health", handlers.HealthCheck)
 		api.POST("/github/issues", handlers.GetGitHubIssues)
 		api.POST("/gitlab/issues", handlers.GetGitLabIssues)
-		api.POST("/migrate", handlers.MigrateIssuesFinal) // Final version with logging
+		api.POST("/migrate", handlers.MigrateWithFiles) // Version with full file support
 	}
 
 	port := os.Getenv("PORT")

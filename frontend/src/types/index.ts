@@ -15,6 +15,7 @@ export interface MigrationConfig {
   owner: string;
   repo: string;
   token: string;
+  session?: string; // GitHub session cookie for file uploads
   baseUrl: string;
   projectId: number;
 }

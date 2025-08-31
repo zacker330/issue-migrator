@@ -13,6 +13,7 @@ function App() {
     owner: '',
     repo: '',
     token: '',
+    session: '',
     baseUrl: '',
     projectId: 0,
   });
@@ -22,6 +23,7 @@ function App() {
     owner: '',
     repo: '',
     token: '',
+    session: '',
     baseUrl: 'https://gitlab.com',
     projectId: 0,
   });

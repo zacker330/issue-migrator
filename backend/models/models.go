@@ -40,6 +40,7 @@ type MigrationRequest struct {
 		ProjectID int    `json:"project_id"`
 		BaseURL   string `json:"base_url"`
 		Token     string `json:"token"`
+		Session   string `json:"session"` // GitHub session cookie for uploads
 	} `json:"source" binding:"required"`
 	Target struct {
 		Type      string `json:"type"`
@@ -48,6 +49,7 @@ type MigrationRequest struct {
 		ProjectID int    `json:"project_id"`
 		BaseURL   string `json:"base_url"`
 		Token     string `json:"token"`
+		Session   string `json:"session"` // GitHub session cookie for uploads
 	} `json:"target" binding:"required"`
 	IssueIDs []int `json:"issue_ids" binding:"required"`
 }
