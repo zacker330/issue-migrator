@@ -235,48 +235,116 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 		}, nil
 	}
 
-	// Create multipart form data
+	// Create multipart form data exactly as shown in the curl command
+	boundary := "----WebKitFormBoundary" + generateBoundary()
 	body := &bytes.Buffer{}
 
-	// GitHub uses a specific format for the upload
-	// The form data from the policy needs to be included
-	boundary := "----WebKitFormBoundary" + generateBoundary()
-
-	// Add all form fields from policy.Form (not FormData)
-	// The order matters - add form fields first, then file
-	formFields := []string{"key", "acl", "policy", "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Signature", "Content-Type", "Cache-Control", "x-amz-meta-Surrogate-Control"}
-
-	for _, key := range formFields {
-		if value, ok := policy.Form[key]; ok {
-			body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-			body.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"%s\"\r\n\r\n", key))
-			body.WriteString(fmt.Sprintf("%s\r\n", value))
-		}
+	// Write form fields in exact order from curl command
+	// 1. key
+	if val, ok := policy.Form["key"]; ok {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"key\"\r\n\r\n")
+		body.WriteString(val + "\r\n")
 	}
 
-	// Add the file last
-	body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-	body.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", filename))
-	body.WriteString(fmt.Sprintf("Content-Type: %s\r\n\r\n", policy.Form["Content-Type"]))
-	body.Write(data)
-	body.WriteString("\r\n")
-	body.WriteString(fmt.Sprintf("--%s--\r\n", boundary))
+	// 2. acl
+	if val, ok := policy.Form["acl"]; ok {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"acl\"\r\n\r\n")
+		body.WriteString(val + "\r\n")
+	}
 
+	// 3. policy
+	if val, ok := policy.Form["policy"]; ok {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"policy\"\r\n\r\n")
+		body.WriteString(val + "\r\n")
+	}
+
+	// 4. X-Amz-Algorithm
+	if val, ok := policy.Form["X-Amz-Algorithm"]; ok {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"X-Amz-Algorithm\"\r\n\r\n")
+		body.WriteString(val + "\r\n")
+	}
+
+	// 5. X-Amz-Credential
+	if val, ok := policy.Form["X-Amz-Credential"]; ok {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"X-Amz-Credential\"\r\n\r\n")
+		body.WriteString(val + "\r\n")
+	}
+
+	// 6. X-Amz-Date
+	if val, ok := policy.Form["X-Amz-Date"]; ok {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"X-Amz-Date\"\r\n\r\n")
+		body.WriteString(val + "\r\n")
+	}
+
+	// 7. X-Amz-Signature
+	if val, ok := policy.Form["X-Amz-Signature"]; ok {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"X-Amz-Signature\"\r\n\r\n")
+		body.WriteString(val + "\r\n")
+	}
+
+	// 8. Content-Type
+	contentType := policy.Form["Content-Type"]
+	if contentType != "" {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"Content-Type\"\r\n\r\n")
+		body.WriteString(contentType + "\r\n")
+	}
+
+	// 9. Cache-Control
+	if val, ok := policy.Form["Cache-Control"]; ok {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"Cache-Control\"\r\n\r\n")
+		body.WriteString(val + "\r\n")
+	}
+
+	// 10. x-amz-meta-Surrogate-Control
+	if val, ok := policy.Form["x-amz-meta-Surrogate-Control"]; ok {
+		body.WriteString("------" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"x-amz-meta-Surrogate-Control\"\r\n\r\n")
+		body.WriteString(val + "\r\n")
+	}
+
+	// 11. File (last)
+	body.WriteString("------" + boundary + "\r\n")
+	body.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", filename))
+	body.WriteString(fmt.Sprintf("Content-Type: %s\r\n\r\n", contentType))
+	body.Write(data)
+	body.WriteString("\r\n------" + boundary + "--\r\n")
+
+	// Create request with exact headers from curl
 	req, err := http.NewRequest("POST", policy.UploadURL, body)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Set("Content-Type", fmt.Sprintf("multipart/form-data; boundary=%s", boundary))
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	// Set headers exactly as in curl command
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Content-Type", fmt.Sprintf("multipart/form-data; boundary=----%s", boundary))
 	req.Header.Set("Origin", "https://github.com")
+	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Referer", "https://github.com/")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+	req.Header.Set("sec-ch-ua", `"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"`)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", `"macOS"`)
+
+	// Log request details for debugging
+	fmt.Printf("[S3] Sending request to: %s\n", policy.UploadURL)
+	fmt.Printf("[S3] Content-Type: %s\n", req.Header.Get("Content-Type"))
+	fmt.Printf("[S3] Body size: %d bytes\n", body.Len())
 
 	client := &http.Client{
 		Timeout: 60 * time.Second,
@@ -287,16 +355,34 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("[S3] Request failed: %v\n", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	fmt.Printf("[S3] Response status: %d\n", resp.StatusCode)
+	fmt.Printf("[S3] Response headers: %v\n", resp.Header)
+
+	responseBody, _ := io.ReadAll(resp.Body)
+
+	// GitHub returns 204 No Content on successful upload
+	if resp.StatusCode == http.StatusNoContent {
+		fmt.Printf("[S3] Upload successful (204 No Content)\n")
+		// Return the asset URL from the policy
+		if policy.Asset.Href != "" {
+			return &GitHubUploadResponse{
+				Href: policy.Asset.Href,
+				URL:  policy.Asset.Href,
+				OriginalName: policy.Asset.OriginalName,
+			}, nil
+		}
+	}
+
 	// GitHub returns a redirect on successful upload
 	if resp.StatusCode == http.StatusSeeOther || resp.StatusCode == http.StatusFound {
-		// The Location header contains the asset URL
 		location := resp.Header.Get("Location")
+		fmt.Printf("[S3] Redirect to: %s\n", location)
 		if location != "" {
-			// Parse the response from the redirect location
 			return &GitHubUploadResponse{
 				Href: location,
 				URL:  location,
@@ -304,21 +390,16 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 		}
 	}
 
-	responseBody, _ := io.ReadAll(resp.Body)
-	
 	// Try to parse as JSON response
 	var uploadResp GitHubUploadResponse
 	if err := json.Unmarshal(responseBody, &uploadResp); err == nil && uploadResp.Href != "" {
+		fmt.Printf("[S3] Got JSON response with href: %s\n", uploadResp.Href)
 		return &uploadResp, nil
 	}
 
-	// If we have the asset info from policy, use it
-	if policy.Asset.Href != "" {
-		return &GitHubUploadResponse{
-			Href: policy.Asset.Href,
-			URL:  policy.Asset.Href,
-		}, nil
-	}
+	// Log error details
+	fmt.Printf("[S3] Upload failed with status %d\n", resp.StatusCode)
+	fmt.Printf("[S3] Response body: %s\n", string(responseBody))
 
 	return nil, fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(responseBody))
 }
