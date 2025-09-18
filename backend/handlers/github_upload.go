@@ -16,17 +16,21 @@ import (
 
 // GitHubUploadPolicy represents the response from GitHub's upload policy endpoint
 type GitHubUploadPolicy struct {
-	UploadURL           string            `json:"upload_url"`
-	UploadAuthenticityToken string        `json:"upload_authenticity_token"`
-	FormData            map[string]string `json:"form_data"`
-	Asset               struct {
-		ID          int    `json:"id"`
-		Name        string `json:"name"`
-		Size        int    `json:"size"`
-		ContentType string `json:"content_type"`
-		Href        string `json:"href"`
+	UploadURL                   string            `json:"upload_url"`
+	Header                      map[string]string `json:"header"`
+	Asset                       struct {
+		ID           int    `json:"id"`
+		Name         string `json:"name"`
+		Size         int    `json:"size"`
+		ContentType  string `json:"content_type"`
+		Href         string `json:"href"`
 		OriginalName string `json:"original_name"`
 	} `json:"asset"`
+	Form                        map[string]string `json:"form"`
+	SameOrigin                  bool              `json:"same_origin"`
+	AssetUploadURL              string            `json:"asset_upload_url"`
+	UploadAuthenticityToken     string            `json:"upload_authenticity_token"`
+	AssetUploadAuthenticityToken string           `json:"asset_upload_authenticity_token"`
 }
 
 // GitHubUploadResponse represents the response after uploading
@@ -51,7 +55,13 @@ func UploadToGitHubWithRepo(data []byte, filename string, token string, session 
 		return "", fmt.Errorf("failed to get upload policy: %w", err)
 	}
 
-	// Step 2: Upload file to S3
+	// Check if GitHub already provided the asset URL (sometimes happens for small files)
+	if policy.Asset.Href != "" {
+		fmt.Printf("[UPLOAD] GitHub already created asset, using URL: %s\n", policy.Asset.Href)
+		return policy.Asset.Href, nil
+	}
+
+	// Step 2: Upload file to S3 if needed
 	uploadedAsset, err := uploadToGitHubS3(policy, data, filename)
 	if err != nil {
 		return "", fmt.Errorf("failed to upload to S3: %w", err)
@@ -199,36 +209,55 @@ func getGitHubUploadPolicy(filename string, size int, token string, session stri
 		return nil, fmt.Errorf("failed to parse policy response: %w", err)
 	}
 
+	fmt.Printf("[UPLOAD] Policy response received:\n")
+	fmt.Printf("[UPLOAD]   - Asset ID: %d\n", policy.Asset.ID)
+	fmt.Printf("[UPLOAD]   - Asset URL: %s\n", policy.Asset.Href)
+	fmt.Printf("[UPLOAD]   - Upload URL: %s\n", policy.UploadURL)
+	fmt.Printf("[UPLOAD]   - Form fields: %d\n", len(policy.Form))
+
 	return &policy, nil
 }
 
 // uploadToGitHubS3 uploads the file to GitHub's S3 bucket
 func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) (*GitHubUploadResponse, error) {
+	fmt.Printf("[S3] Starting S3 upload for file: %s\n", filename)
+	fmt.Printf("[S3] Upload URL: %s\n", policy.UploadURL)
+	fmt.Printf("[S3] Asset already has href: %s\n", policy.Asset.Href)
+
+	// GitHub already created the asset and gave us the URL
+	// We can return it immediately if it's already uploaded
+	if policy.Asset.Href != "" {
+		fmt.Printf("[S3] Asset already uploaded, returning existing URL\n")
+		return &GitHubUploadResponse{
+			Href: policy.Asset.Href,
+			URL:  policy.Asset.Href,
+			OriginalName: policy.Asset.OriginalName,
+		}, nil
+	}
+
 	// Create multipart form data
 	body := &bytes.Buffer{}
-	
+
 	// GitHub uses a specific format for the upload
 	// The form data from the policy needs to be included
 	boundary := "----WebKitFormBoundary" + generateBoundary()
-	
-	// Add all form fields from policy
-	for key, value := range policy.FormData {
-		body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-		body.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"%s\"\r\n\r\n", key))
-		body.WriteString(fmt.Sprintf("%s\r\n", value))
+
+	// Add all form fields from policy.Form (not FormData)
+	// The order matters - add form fields first, then file
+	formFields := []string{"key", "acl", "policy", "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Signature", "Content-Type", "Cache-Control", "x-amz-meta-Surrogate-Control"}
+
+	for _, key := range formFields {
+		if value, ok := policy.Form[key]; ok {
+			body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+			body.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"%s\"\r\n\r\n", key))
+			body.WriteString(fmt.Sprintf("%s\r\n", value))
+		}
 	}
 
-	// Add authenticity token
-	if policy.UploadAuthenticityToken != "" {
-		body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
-		body.WriteString("Content-Disposition: form-data; name=\"authenticity_token\"\r\n\r\n")
-		body.WriteString(fmt.Sprintf("%s\r\n", policy.UploadAuthenticityToken))
-	}
-
-	// Add the file
+	// Add the file last
 	body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
 	body.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", filename))
-	body.WriteString(fmt.Sprintf("Content-Type: %s\r\n\r\n", getContentType(filename)))
+	body.WriteString(fmt.Sprintf("Content-Type: %s\r\n\r\n", policy.Form["Content-Type"]))
 	body.Write(data)
 	body.WriteString("\r\n")
 	body.WriteString(fmt.Sprintf("--%s--\r\n", boundary))
