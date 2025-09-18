@@ -1,4 +1,5 @@
 # Backend
+backend/issue-migrator-backend
 backend/backend
 /backend/issue-migrator
 /backend/.env

@@ -78,7 +78,7 @@ function App() {
   };
 
   return (
-    <Container className="py-5">
+    <Container className="py-2">
       <h1 className="mb-4">Issue Migrator</h1>
       <p className="lead mb-4">Migrate issues between GitHub and GitLab platforms</p>
 

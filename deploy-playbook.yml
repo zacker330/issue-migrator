@@ -1,0 +1,213 @@
+---
+- name: Deploy Issue Migrator Application
+  hosts: ubuntu_servers
+  become: yes
+  vars:
+    app_name: issue-migrator
+    app_path: /opt/{{ app_name }}
+    docker_compose_version: "2.21.0"
+    app_user: app
+    app_group: app
+
+  tasks:
+    - name: Create app group
+      group:
+        name: "{{ app_group }}"
+        state: present
+
+    - name: Create app user
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        home: /home/{{ app_user }}
+        shell: /bin/bash
+        create_home: yes
+        state: present
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - python3-pip
+          - virtualenv
+          - python3-setuptools
+          - gnupg
+          - lsb-release
+          - rsync
+        state: present
+
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+
+    - name: Install Docker Compose
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/v{{ docker_compose_version }}/docker-compose-linux-x86_64"
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+
+    - name: Ensure Docker is started and enabled
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add app user to docker group
+      user:
+        name: "{{ app_user }}"
+        groups: docker
+        append: yes
+
+    - name: Create application directory
+      file:
+        path: "{{ app_path }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0755'
+
+    - name: Stop existing containers (if any)
+      become: yes
+      become_user: "{{ app_user }}"
+      shell: |
+        cd {{ app_path }}
+        docker-compose down || true
+      ignore_errors: yes
+
+    - name: Copy application files to remote server
+      synchronize:
+        src: "{{ playbook_dir }}/"
+        dest: "{{ app_path }}"
+        delete: yes
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=*.log"
+          - "--exclude=.env.local"
+          - "--exclude=dist"
+          - "--exclude=build"
+          - "--exclude=.DS_Store"
+          - "--exclude=*.pyc"
+          - "--exclude=__pycache__"
+          - "--exclude=.vscode"
+          - "--exclude=.idea"
+          - "--exclude=*.swp"
+          - "--exclude=*.swo"
+          - "--exclude=deploy-playbook.yml"
+          - "--exclude=inventory.ini"
+          - "--exclude=frontend/node_modules"
+          - "--exclude=backend/vendor"
+
+    - name: Set proper permissions
+      file:
+        path: "{{ app_path }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0755'
+        recurse: yes
+
+    - name: Create .env file for backend (if needed)
+      copy:
+        content: |
+          # Backend environment variables
+          PORT=8080
+          GIN_MODE=release
+        dest: "{{ app_path }}/backend/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0644'
+      when: backend_env_vars is defined
+
+    - name: Build and start Docker containers
+      become: yes
+      become_user: "{{ app_user }}"
+      shell: |
+        cd {{ app_path }}
+        docker-compose build --no-cache
+        docker-compose up -d
+      register: docker_compose_output
+
+    - name: Wait for backend to be ready
+      uri:
+        url: "http://localhost:8080/api/health"
+        method: GET
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 5
+
+    - name: Wait for frontend to be ready
+      uri:
+        url: "http://localhost:3000"
+        method: GET
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 5
+
+    - name: Show running containers
+      become: yes
+      become_user: "{{ app_user }}"
+      shell: docker ps
+      register: docker_ps_output
+
+    - name: Display container status
+      debug:
+        msg: "{{ docker_ps_output.stdout_lines }}"
+
+    - name: Get container logs (last 20 lines)
+      become: yes
+      become_user: "{{ app_user }}"
+      shell: |
+        cd {{ app_path }}
+        echo "=== Backend Logs ===" && docker-compose logs --tail=20 backend
+        echo "=== Frontend Logs ===" && docker-compose logs --tail=20 frontend
+      register: logs_output
+      ignore_errors: yes
+
+    - name: Display recent logs
+      debug:
+        msg: "{{ logs_output.stdout_lines }}"
+
+    - name: Display deployment information
+      debug:
+        msg:
+          - "Deployment completed successfully!"
+          - "Application is running at:"
+          - "  - Frontend: http://{{ ansible_host }}:3000"
+          - "  - Backend API: http://{{ ansible_host }}:8080"
+          - ""
+          - "Useful commands:"
+          - "  - View logs: docker-compose logs -f"
+          - "  - Stop services: docker-compose down"
+          - "  - Restart services: docker-compose restart"
+          - "  - View container status: docker ps"
+
+  handlers:
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted

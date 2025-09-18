@@ -2,10 +2,12 @@ package handlers
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -36,9 +38,15 @@ type GitHubUploadResponse struct {
 }
 
 // UploadToGitHub uploads a file to GitHub using the browser API
+// Note: repositoryID should be passed if uploading to a specific repo
 func UploadToGitHub(data []byte, filename string, token string, session string) (string, error) {
+	return UploadToGitHubWithRepo(data, filename, token, session, "")
+}
+
+// UploadToGitHubWithRepo uploads a file to GitHub with a specific repository ID
+func UploadToGitHubWithRepo(data []byte, filename string, token string, session string, repositoryID string) (string, error) {
 	// Step 1: Get upload policy
-	policy, err := getGitHubUploadPolicy(filename, len(data), token, session)
+	policy, err := getGitHubUploadPolicy(filename, len(data), token, session, repositoryID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get upload policy: %w", err)
 	}
@@ -54,67 +62,140 @@ func UploadToGitHub(data []byte, filename string, token string, session string) 
 }
 
 // getGitHubUploadPolicy gets the upload policy from GitHub
-func getGitHubUploadPolicy(filename string, size int, token string, session string) (*GitHubUploadPolicy, error) {
+func getGitHubUploadPolicy(filename string, size int, token string, session string, repositoryID string) (*GitHubUploadPolicy, error) {
 	url := "https://github.com/upload/policies/assets"
 
-	// Prepare request body
-	requestBody := map[string]interface{}{
-		"name":         filename,
-		"size":         size,
-		"content_type": getContentType(filename),
-		"repository_id": nil, // This might need to be set for private repos
-		"repository_nwo": nil,
+	fmt.Printf("[UPLOAD] Requesting upload policy for file: %s (size: %d bytes)\n", filename, size)
+	if repositoryID != "" {
+		fmt.Printf("[UPLOAD] Repository ID: %s\n", repositoryID)
 	}
 
-	jsonBody, err := json.Marshal(requestBody)
+	// Create multipart form data like the browser does
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	// Add repository_id if provided
+	if repositoryID != "" {
+		if err := writer.WriteField("repository_id", repositoryID); err != nil {
+			return nil, err
+		}
+	}
+
+	// Add required fields
+	if err := writer.WriteField("name", filename); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteField("size", fmt.Sprintf("%d", size)); err != nil {
+		return nil, err
+	}
+	if err := writer.WriteField("content_type", getContentType(filename)); err != nil {
+		return nil, err
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("[UPLOAD] Form data size: %d bytes\n", body.Len())
+
+	req, err := http.NewRequest("POST", url, body)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-
-	// Set headers to mimic browser request
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+	// Set headers to match the browser request exactly
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Github-Verified-Fetch", "true")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Priority", "u=1, i")
+	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Origin", "https://github.com")
-	req.Header.Set("Referer", "https://github.com")
-	
+	req.Header.Set("Referer", "https://github.com/")
+
+	// Generate a nonce like GitHub does
+	nonce := fmt.Sprintf("v2:%s", generateNonce())
+	req.Header.Set("X-Fetch-Nonce", nonce)
+
 	// Add authentication
 	if session != "" {
 		// Use the session cookie for authentication
-		req.Header.Set("Cookie", fmt.Sprintf("user_session=%s", session))
+		// GitHub also needs other cookies for CSRF protection
+		cookieHeader := fmt.Sprintf("user_session=%s; logged_in=yes", session)
+		req.Header.Set("Cookie", cookieHeader)
 		fmt.Printf("[AUTH] Using GitHub session for upload authentication\n")
+		fmt.Printf("[AUTH] Cookie header length: %d\n", len(cookieHeader))
 	} else if token != "" {
 		// Fallback to token if no session provided
 		req.Header.Set("Authorization", "token "+token)
-		fmt.Printf("[AUTH] Using GitHub token for upload (may not work)\n")
+		fmt.Printf("[AUTH] Using GitHub token for upload (may not work for uploads)\n")
+		fmt.Printf("[WARNING] GitHub file uploads typically require session cookies, not just API tokens\n")
+	} else {
+		fmt.Printf("[WARNING] No authentication provided for GitHub upload\n")
 	}
 
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
 
+	fmt.Printf("[UPLOAD] Sending request to GitHub...\n")
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("[ERROR] Request failed: %v\n", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	fmt.Printf("[UPLOAD] Response status: %d\n", resp.StatusCode)
+	fmt.Printf("[UPLOAD] Response headers: %v\n", resp.Header)
+
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
+	fmt.Printf("[UPLOAD] Response body length: %d\n", len(respBody))
+
+	// Status 42 might mean "422 Unprocessable Entity" with a typo, or it could be a custom code
+	if resp.StatusCode == 422 || resp.StatusCode == 42 {
+		fmt.Printf("[ERROR] GitHub returned status %d (Unprocessable Entity)\n", resp.StatusCode)
+		fmt.Printf("[ERROR] This usually means:\n")
+		fmt.Printf("[ERROR]   1. Invalid or expired session cookie\n")
+		fmt.Printf("[ERROR]   2. Missing required parameters\n")
+		fmt.Printf("[ERROR]   3. File size or type restrictions\n")
+		fmt.Printf("[ERROR] Response: %s\n", string(respBody))
+		return nil, fmt.Errorf("GitHub upload not available - session may be invalid or expired")
+	}
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("failed to get upload policy: status %d, body: %s", resp.StatusCode, string(body))
+		fmt.Printf("[ERROR] GitHub upload policy request failed\n")
+		fmt.Printf("[ERROR] Status: %d\n", resp.StatusCode)
+		fmt.Printf("[ERROR] Response: %s\n", string(respBody))
+
+		// Check for specific error messages
+		if strings.Contains(string(respBody), "browser did something unexpected") {
+			fmt.Printf("[ERROR] GitHub detected non-browser request\n")
+			fmt.Printf("[INFO] This error typically means:\n")
+			fmt.Printf("[INFO]   1. Missing or invalid session cookie\n")
+			fmt.Printf("[INFO]   2. Missing CSRF token\n")
+			fmt.Printf("[INFO]   3. Request doesn't match browser fingerprint\n")
+			return nil, fmt.Errorf("GitHub requires valid browser session for uploads. Please provide 'user_session' cookie value")
+		}
+
+		return nil, fmt.Errorf("failed to get upload policy: status %d", resp.StatusCode)
 	}
 
 	var policy GitHubUploadPolicy
-	if err := json.Unmarshal(body, &policy); err != nil {
+	if err := json.Unmarshal(respBody, &policy); err != nil {
 		return nil, fmt.Errorf("failed to parse policy response: %w", err)
 	}
 
@@ -158,9 +239,15 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 	}
 
 	req.Header.Set("Content-Type", fmt.Sprintf("multipart/form-data; boundary=%s", boundary))
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	req.Header.Set("Origin", "https://github.com")
-	req.Header.Set("Referer", "https://github.com")
+	req.Header.Set("Referer", "https://github.com/")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
 
 	client := &http.Client{
 		Timeout: 60 * time.Second,
@@ -210,17 +297,95 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 // getContentType returns the MIME type for a file
 func getContentType(filename string) string {
 	ext := strings.ToLower(filepath.Ext(filename))
+
+	// First try standard mime type detection
 	mimeType := mime.TypeByExtension(ext)
+
+	// If standard detection fails, use a comprehensive mapping for common image types
 	if mimeType == "" {
-		// Default to binary
-		return "application/octet-stream"
+		switch ext {
+		case ".jpg", ".jpeg":
+			return "image/jpeg"
+		case ".png":
+			return "image/png"
+		case ".gif":
+			return "image/gif"
+		case ".bmp":
+			return "image/bmp"
+		case ".webp":
+			return "image/webp"
+		case ".svg":
+			return "image/svg+xml"
+		case ".ico":
+			return "image/x-icon"
+		case ".tiff", ".tif":
+			return "image/tiff"
+		case ".heic":
+			return "image/heic"
+		case ".heif":
+			return "image/heif"
+		case ".avif":
+			return "image/avif"
+		case ".pdf":
+			return "application/pdf"
+		case ".zip":
+			return "application/zip"
+		case ".tar":
+			return "application/x-tar"
+		case ".gz":
+			return "application/gzip"
+		case ".mp4":
+			return "video/mp4"
+		case ".webm":
+			return "video/webm"
+		case ".mov":
+			return "video/quicktime"
+		case ".avi":
+			return "video/x-msvideo"
+		case ".mp3":
+			return "audio/mpeg"
+		case ".wav":
+			return "audio/wav"
+		case ".ogg":
+			return "audio/ogg"
+		case ".txt":
+			return "text/plain"
+		case ".json":
+			return "application/json"
+		case ".xml":
+			return "application/xml"
+		case ".html", ".htm":
+			return "text/html"
+		case ".css":
+			return "text/css"
+		case ".js":
+			return "application/javascript"
+		case ".ts":
+			return "application/typescript"
+		default:
+			// Only use octet-stream as last resort
+			return "application/octet-stream"
+		}
 	}
-	return mimeType
+
+	// Clean up the mime type (remove charset info if present)
+	if idx := strings.Index(mimeType, ";"); idx != -1 {
+		mimeType = mimeType[:idx]
+	}
+
+	return strings.TrimSpace(mimeType)
 }
 
 // generateBoundary generates a random boundary for multipart form
 func generateBoundary() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+// generateNonce generates a random nonce like GitHub expects
+func generateNonce() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // UploadFileToGitHubWithAuth uploads a file using authenticated session

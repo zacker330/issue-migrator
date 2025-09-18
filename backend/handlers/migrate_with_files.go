@@ -12,6 +12,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/go-github/v57/github"
@@ -23,7 +24,7 @@ import (
 func MigrateWithFiles(c *gin.Context) {
 	var req models.MigrationRequest
 	log.Println("Starting migration with file support")
-	
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -79,7 +80,7 @@ func migrateGHtoGLWithFiles(req models.MigrationRequest, ginCtx *gin.Context) mo
 		}
 
 		// Process all attachments (images and files) in issue body
-		fmt.Printf("[MIGRATE] Processing attachments in issue #%d body\n", issueID)
+		fmt.Printf("[MIGRATE] Processing attachments in issue #%d body1111\n", issueID)
 		processedBody := processAttachments(
 			issue.GetBody(),
 			req.Target.ProjectID,
@@ -93,7 +94,19 @@ func migrateGHtoGLWithFiles(req models.MigrationRequest, ginCtx *gin.Context) mo
 			labels[i] = label.GetName()
 		}
 
-		description := fmt.Sprintf("*Migrated from GitHub: %s*\n\n%s", issue.GetHTMLURL(), processedBody)
+		// Create migration header with timestamp information
+		migrationHeader := fmt.Sprintf("### 🔄 Migrated from GitHub\n\n")
+		migrationHeader += fmt.Sprintf("**Original Issue:** %s\n", issue.GetHTMLURL())
+		migrationHeader += fmt.Sprintf("**Original Author:** @%s\n", issue.User.GetLogin())
+		migrationHeader += fmt.Sprintf("**Created:** %s\n", issue.GetCreatedAt().Format("2006-01-02 15:04:05 UTC"))
+		migrationHeader += fmt.Sprintf("**Last Updated:** %s\n", issue.GetUpdatedAt().Format("2006-01-02 15:04:05 UTC"))
+		if issue.GetState() == "closed" && issue.ClosedAt != nil {
+			migrationHeader += fmt.Sprintf("**Closed:** %s\n", issue.GetClosedAt().Format("2006-01-02 15:04:05 UTC"))
+		}
+		migrationHeader += fmt.Sprintf("**State:** %s\n\n", issue.GetState())
+		migrationHeader += "---\n\n"
+
+		description := migrationHeader + processedBody
 		title := issue.GetTitle()
 
 		createOpts := &gitlab.CreateIssueOptions{
@@ -128,7 +141,14 @@ func migrateGHtoGLWithFiles(req models.MigrationRequest, ginCtx *gin.Context) mo
 					req.Target.BaseURL,
 					req.Source.Token,
 				)
-				body := fmt.Sprintf("**@%s commented:**\n\n%s", comment.User.GetLogin(), processedComment)
+				// Include comment timestamp
+				commentHeader := fmt.Sprintf("**@%s** commented on %s",
+					comment.User.GetLogin(),
+					comment.GetCreatedAt().Format("2006-01-02 15:04:05 UTC"))
+				if comment.UpdatedAt != nil && comment.GetUpdatedAt().After(comment.GetCreatedAt().Time) {
+					commentHeader += fmt.Sprintf(" _(edited %s)_", comment.GetUpdatedAt().Format("2006-01-02 15:04:05 UTC"))
+				}
+				body := fmt.Sprintf("%s\n\n%s", commentHeader, processedComment)
 				noteOpts := &gitlab.CreateIssueNoteOptions{
 					Body: &body,
 				}
@@ -158,7 +178,7 @@ func migrateGLtoGHWithFiles(req models.MigrationRequest, ginCtx *gin.Context) mo
 	glClient, _ := gitlab.NewClient(req.Source.Token, gitlab.WithBaseURL(req.Source.BaseURL))
 	ghClient := github.NewClient(nil).WithAuthToken(req.Target.Token)
 	ctx := context.Background()
-	
+
 	fmt.Println("[INFO] GitLab to GitHub migration: Attempting to upload files to GitHub")
 	fmt.Println("[INFO] Note: GitHub upload API is unofficial and may require browser session")
 
@@ -176,15 +196,20 @@ func migrateGLtoGHWithFiles(req models.MigrationRequest, ginCtx *gin.Context) mo
 		}
 
 		// Try to download and re-upload GitLab attachments to GitHub
-		processedBody := processGitLabToGitHub(issue.Description, req.Source.BaseURL, req.Source.Token, req.Target.Token, req.Target.Session)
-		
-		// Create migration header with better formatting
+		processedBody := processGitLabToGitHub(issue.Description, req.Source.BaseURL, req.Source.ProjectID, req.Source.Token, req.Target.Token, req.Target.Session, req.Source.Session, req.Target.Owner, req.Target.Repo)
+
+		// Create migration header with detailed timestamp information
 		migrationHeader := fmt.Sprintf("### 🔄 Migrated from GitLab\n\n")
 		migrationHeader += fmt.Sprintf("**Original Issue:** %s\n", issue.WebURL)
 		migrationHeader += fmt.Sprintf("**Original Author:** @%s\n", issue.Author.Username)
-		migrationHeader += fmt.Sprintf("**Created:** %s\n\n", issue.CreatedAt.Format("2006-01-02"))
+		migrationHeader += fmt.Sprintf("**Created:** %s\n", issue.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+		migrationHeader += fmt.Sprintf("**Last Updated:** %s\n", issue.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
+		if issue.State == "closed" && issue.ClosedAt != nil {
+			migrationHeader += fmt.Sprintf("**Closed:** %s\n", issue.ClosedAt.Format("2006-01-02 15:04:05 UTC"))
+		}
+		migrationHeader += fmt.Sprintf("**State:** %s\n\n", issue.State)
 		migrationHeader += "---\n\n"
-		
+
 		body := migrationHeader + processedBody
 
 		labels := make([]string, len(issue.Labels))
@@ -216,13 +241,20 @@ func migrateGLtoGHWithFiles(req models.MigrationRequest, ginCtx *gin.Context) mo
 
 		fmt.Printf("[SUCCESS] Created GitHub issue #%d for GitLab issue #%d\n", newIssue.GetNumber(), issueID)
 
-		// Process notes
+		// Process notes with timestamps
 		notes, _, err := glClient.Notes.ListIssueNotes(req.Source.ProjectID, issueID, nil)
 		if err == nil {
 			fmt.Printf("[MIGRATE] Processing %d notes for issue #%d\n", len(notes), issueID)
 			for _, note := range notes {
-				processedNote := processGitLabToGitHub(note.Body, req.Source.BaseURL, req.Source.Token, req.Target.Token, req.Target.Session)
-				body := fmt.Sprintf("**@%s commented:**\n\n%s", note.Author.Username, processedNote)
+				processedNote := processGitLabToGitHub(note.Body, req.Source.BaseURL, req.Source.ProjectID, req.Source.Token, req.Target.Token, req.Target.Session, req.Source.Session, req.Target.Owner, req.Target.Repo)
+				// Include note timestamp
+				commentHeader := fmt.Sprintf("**@%s** commented on %s",
+					note.Author.Username,
+					note.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+				if note.UpdatedAt != nil && note.UpdatedAt.After(*note.CreatedAt) {
+					commentHeader += fmt.Sprintf(" _(edited %s)_", note.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
+				}
+				body := fmt.Sprintf("%s\n\n%s", commentHeader, processedNote)
 				comment := &github.IssueComment{
 					Body: &body,
 				}
@@ -433,8 +465,8 @@ func findAllAttachments(content string) []AttachmentInfo {
 	mdLinkRegex := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 	matches = mdLinkRegex.FindAllStringSubmatch(content, -1)
 	for _, match := range matches {
-		if len(match) > 2 && !seen[match[2]] && !strings.HasPrefix(match[0], "!") && 
-		   isValidURL(match[2]) && isFileURL(match[2]) {
+		if len(match) > 2 && !seen[match[2]] && !strings.HasPrefix(match[0], "!") &&
+			isValidURL(match[2]) && isFileURL(match[2]) {
 			attachments = append(attachments, AttachmentInfo{
 				URL:          match[2],
 				IsImage:      false,
@@ -536,7 +568,10 @@ func uploadFileToGitLab(projectID int, data []byte, filename string, token strin
 	}
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+		if resp.StatusCode == http.StatusForbidden {
+			return "", fmt.Errorf("upload failed with status 403 Forbidden - Check that your GitLab token has 'api' scope and write access to project %d: %s", projectID, string(respBody))
+		}
+		return "", fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var uploadResult struct {
@@ -602,7 +637,7 @@ func sanitizeFilename(name string) string {
 // guessExtension tries to guess file extension
 func guessExtension(url string) string {
 	lowerURL := strings.ToLower(url)
-	
+
 	extensions := map[string]string{
 		"png":  ".png",
 		"jpg":  ".jpg",
@@ -624,81 +659,162 @@ func guessExtension(url string) string {
 }
 
 // processGitLabToGitHub attempts to download GitLab files and upload to GitHub
-func processGitLabToGitHub(content string, gitlabURL string, gitlabToken string, githubToken string, githubSession string) string {
+func processGitLabToGitHub(content string, gitlabURL string, projectID int, gitlabToken string, githubToken string, githubSession string, gitlabSession string, githubOwner string, githubRepo string) string {
 	if content == "" {
 		return content
 	}
 
-	// First ensure all URLs are absolute
-	content = fixGitLabAttachmentURLs(content, gitlabURL)
-	
+	// First ensure all URLs are absolute and fix any old format URLs
+	content = fixGitLabAttachmentURLs(content, gitlabURL, projectID)
+
 	// Find all GitLab attachment URLs
 	attachments := findGitLabAttachments(content, gitlabURL)
-	
+
 	if len(attachments) == 0 {
 		return content
 	}
-	
+
 	fmt.Printf("[ATTACH] Found %d GitLab attachments to process\n", len(attachments))
-	
+
 	urlMap := make(map[string]string)
 	client := &http.Client{}
-	
+
 	for _, attachment := range attachments {
-		fmt.Printf("[ATTACH] Processing GitLab attachment: %s\n", attachment.URL)
-		
+		fmt.Printf("[ATTACH] Processing GitLab attachment11111: %s\n", attachment.URL)
+
 		// Download from GitLab
 		req, err := http.NewRequest("GET", attachment.URL, nil)
 		if err != nil {
 			fmt.Printf("[ERROR] Failed to create request: %v\n", err)
 			continue
 		}
-		
-		// Add GitLab token if it's a private project
-		if gitlabToken != "" {
+
+		// Try using GitLab session cookie first (for /uploads/ endpoints)
+		if gitlabSession != "" {
+			req.Header.Set("Cookie", fmt.Sprintf("_gitlab_session=%s", gitlabSession))
+			fmt.Printf("[AUTH] Using GitLab session cookie for download\n")
+		} else if gitlabToken != "" {
+			// Fallback to API token (might work for some endpoints)
 			req.Header.Set("PRIVATE-TOKEN", gitlabToken)
+			fmt.Printf("[AUTH] Using GitLab API token for download\n")
 		}
-		
+
 		resp, err := client.Do(req)
 		if err != nil {
 			fmt.Printf("[ERROR] Failed to download from GitLab: %v\n", err)
 			continue
 		}
-		
+
 		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("[WARNING] GitLab download returned status %d\n", resp.StatusCode)
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnauthorized {
+				fmt.Printf("[WARNING] Cannot download GitLab attachment (status %d): %s\n", resp.StatusCode, attachment.URL)
+				if gitlabSession == "" {
+					fmt.Printf("[INFO] GitLab /uploads/ URLs require browser session authentication.\n")
+					fmt.Printf("[INFO] To download attachments from private repos, provide a GitLab session cookie.\n")
+					fmt.Printf("[INFO] How to get GitLab session cookie:\n")
+					fmt.Printf("[INFO]   1. Log in to GitLab in your browser\n")
+					fmt.Printf("[INFO]   2. Open Developer Tools (F12)\n")
+					fmt.Printf("[INFO]   3. Go to Application/Storage -> Cookies\n")
+					fmt.Printf("[INFO]   4. Find and copy the '_gitlab_session' cookie value\n")
+				} else {
+					fmt.Printf("[INFO] Session cookie provided but still cannot access. The session may be expired or invalid.\n")
+				}
+				fmt.Printf("[INFO] Alternative workarounds:\n")
+				fmt.Printf("[INFO]   1. Make the GitLab project public temporarily during migration\n")
+				fmt.Printf("[INFO]   2. Manually download and re-upload attachments after migration\n")
+				// Keep the original URL in the content
+				fmt.Printf("[INFO] Keeping original GitLab URL: %s\n", attachment.URL)
+			} else {
+				fmt.Printf("[WARNING] GitLab download returned status %d for URL: %s\n", resp.StatusCode, attachment.URL)
+				fmt.Printf("[DEBUG] Response: %s\n", string(bodyBytes))
+			}
 			resp.Body.Close()
 			continue
 		}
-		
+
 		data, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
 			fmt.Printf("[ERROR] Failed to read data: %v\n", err)
 			continue
 		}
-		
+
 		fmt.Printf("[ATTACH] Downloaded %d bytes from GitLab\n", len(data))
-		
-		// Try to upload to GitHub
-		// Note: This is experimental and may not work without proper session auth
-		githubURL, err := UploadToGitHub(data, attachment.Filename, githubToken, githubSession)
-		if err != nil {
-			fmt.Printf("[WARNING] GitHub upload failed: %v\n", err)
+
+		// Detect file type and add extension if missing
+		filename := attachment.Filename
+		if !strings.Contains(filename, ".") || strings.HasSuffix(filename, "/Image") || strings.HasSuffix(filename, "/image") {
+			// No extension or generic "Image" name - detect from content
+			detectedExt := detectFileExtension(data)
+			if detectedExt != "" {
+				// If filename is just "Image", replace it with a better name
+				if filename == "Image" || filename == "image" || strings.HasSuffix(filename, "/Image") || strings.HasSuffix(filename, "/image") {
+					filename = "image" + detectedExt
+				} else if !strings.HasSuffix(filename, detectedExt) {
+					filename = filename + detectedExt
+				}
+				fmt.Printf("[ATTACH] Detected file type: %s, using filename: %s\n", detectedExt, filename)
+			}
+		}
+
+		// Try to upload to GitHub (experimental - often fails due to GitHub's security)
+		// Skip if no session provided since it won't work anyway
+		if githubSession == "" {
+			fmt.Printf("[INFO] Skipping GitHub upload (no session cookie provided)\n")
 			fmt.Printf("[INFO] File will remain on GitLab: %s\n", attachment.URL)
 			continue
 		}
-		
+
+		// Try to get repository ID if we have owner and repo
+		var repoID string
+		if githubOwner != "" && githubRepo != "" && githubToken != "" {
+			repoID = getGitHubRepoID(githubOwner, githubRepo, githubToken)
+			if repoID != "" {
+				fmt.Printf("[INFO] Using repository ID: %s for uploads\n", repoID)
+			}
+		}
+
+		githubURL, err := UploadToGitHubWithRepo(data, filename, githubToken, githubSession, repoID)
+		if err != nil {
+			fmt.Printf("[WARNING] GitHub upload failed: %v\n", err)
+
+			// Only show detailed message once
+			if !strings.Contains(content, "_GitHub_upload_notice_shown_") {
+				fmt.Printf("[INFO] ========================================\n")
+				fmt.Printf("[INFO] GitHub Upload Limitation:\n")
+				fmt.Printf("[INFO] GitHub's file upload API requires a complete browser session\n")
+				fmt.Printf("[INFO] including CSRF tokens and other security measures that cannot\n")
+				fmt.Printf("[INFO] be easily obtained programmatically.\n")
+				fmt.Printf("[INFO] \n")
+				fmt.Printf("[INFO] Current behavior:\n")
+				fmt.Printf("[INFO] - Files remain hosted on GitLab\n")
+				fmt.Printf("[INFO] - Links are preserved in migrated issues\n")
+				fmt.Printf("[INFO] - Images will display if GitLab repo is public\n")
+				fmt.Printf("[INFO] \n")
+				fmt.Printf("[INFO] Alternatives:\n")
+				fmt.Printf("[INFO] 1. Make GitLab repo public during migration\n")
+				fmt.Printf("[INFO] 2. Manually re-upload important files after migration\n")
+				fmt.Printf("[INFO] 3. Use GitHub Actions for automated uploads\n")
+				fmt.Printf("[INFO] ========================================\n")
+				content = content + "<!-- _GitHub_upload_notice_shown_ -->"
+			}
+
+			fmt.Printf("[INFO] File will remain on GitLab: %s\n", attachment.URL)
+			// Don't replace the URL, keep it pointing to GitLab
+			continue
+		}
+
 		fmt.Printf("[SUCCESS] Uploaded to GitHub: %s\n", githubURL)
 		urlMap[attachment.URL] = githubURL
 	}
-	
+
 	// Replace successful uploads
 	result := content
 	for oldURL, newURL := range urlMap {
 		result = strings.ReplaceAll(result, oldURL, newURL)
 	}
-	
+
 	return result
 }
 
@@ -712,67 +828,101 @@ type GitLabAttachment struct {
 func findGitLabAttachments(content string, gitlabURL string) []GitLabAttachment {
 	var attachments []GitLabAttachment
 	seen := make(map[string]bool)
-	
-	// Pattern for GitLab uploads
-	uploadPattern := regexp.MustCompile(gitlabURL + `/uploads/([a-f0-9]+)/([^"'\s\)]+)`)
-	matches := uploadPattern.FindAllStringSubmatch(content, -1)
-	
+
+	// Pattern for GitLab uploads (new format only, since we convert old to new)
+	// Format: https://gitlab.com/-/project/74006604/uploads/c3365884e9152d7384859c7ac5a16ff4/Image
+	projectUploadPattern := regexp.MustCompile(gitlabURL + `/-/project/(\d+)/uploads/([a-f0-9]+)/([^"'\s\)]+)`)
+
+	matches := projectUploadPattern.FindAllStringSubmatch(content, -1)
 	for _, match := range matches {
-		if len(match) > 2 {
+		if len(match) > 3 {
 			fullURL := match[0]
-			filename := match[2]
-			
+			projectID := match[1]
+			hash := match[2]
+			filename := match[3]
+
 			if !seen[fullURL] {
 				attachments = append(attachments, GitLabAttachment{
 					URL:      fullURL,
 					Filename: filename,
 				})
 				seen[fullURL] = true
+				fmt.Printf("[ATTACH] Found GitLab attachment: project=%s, hash=%s, file=%s, url=%s\n", projectID, hash, filename, fullURL)
 			}
 		}
 	}
-	
+
 	return attachments
 }
 
+// getGitHubRepoID fetches the repository ID from GitHub API
+func getGitHubRepoID(owner string, repo string, token string) string {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		fmt.Printf("[WARNING] Failed to create request for repo ID: %v\n", err)
+		return ""
+	}
+
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("[WARNING] Failed to fetch repo ID: %v\n", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("[WARNING] Failed to get repo info: status %d\n", resp.StatusCode)
+		return ""
+	}
+
+	var repoInfo struct {
+		ID int64 `json:"id"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&repoInfo); err != nil {
+		fmt.Printf("[WARNING] Failed to parse repo info: %v\n", err)
+		return ""
+	}
+
+	return fmt.Sprintf("%d", repoInfo.ID)
+}
+
 // fixGitLabAttachmentURLs converts relative GitLab URLs to absolute and ensures proper formatting
-func fixGitLabAttachmentURLs(content string, baseURL string) string {
+func fixGitLabAttachmentURLs(content string, baseURL string, projectID int) string {
 	if content == "" {
 		return content
 	}
 
-	// First, convert relative URLs to absolute
-	content = strings.ReplaceAll(content, `](/uploads/`, `](`+baseURL+`/uploads/`)
-	content = strings.ReplaceAll(content, `="/uploads/`, `="`+baseURL+`/uploads/`)
-	content = strings.ReplaceAll(content, `='/uploads/`, `='`+baseURL+`/uploads/`)
-	
-	// Fix any GitLab URLs that are missing the base URL
-	// Pattern: ![text](uploads/...) -> ![text](https://gitlab.com/uploads/...)
-	uploadsRegex := regexp.MustCompile(`\]\((uploads/[^)]+)\)`)
-	content = uploadsRegex.ReplaceAllString(content, `](`+baseURL+`/$1)`)
-	
-	// Ensure images with just filename get proper URL
-	// Pattern: ![Image](xxx) where xxx doesn't start with http
-	imageRegex := regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
-	matches := imageRegex.FindAllStringSubmatch(content, -1)
-	for _, match := range matches {
-		if len(match) > 2 {
-			originalURL := match[2]
-			// If URL doesn't start with http and contains /uploads/
-			if !strings.HasPrefix(originalURL, "http") && strings.Contains(originalURL, "uploads/") {
-				fullURL := baseURL + "/" + strings.TrimPrefix(originalURL, "/")
-				oldPattern := fmt.Sprintf("![%s](%s)", match[1], originalURL)
-				newPattern := fmt.Sprintf("![%s](%s)", match[1], fullURL)
-				content = strings.ReplaceAll(content, oldPattern, newPattern)
-			}
-		}
-	}
-	
+	// Convert old format URLs to new format FIRST
+	// Old: /uploads/xxx/file or https://gitlab.com/uploads/xxx/file
+	// New: https://gitlab.com/-/project/{projectID}/uploads/xxx/file
+
+	// Fix relative old format URLs
+	content = strings.ReplaceAll(content, `](/uploads/`, `](/-/project/`+fmt.Sprintf("%d", projectID)+`/uploads/`)
+	content = strings.ReplaceAll(content, `="/uploads/`, `="/-/project/`+fmt.Sprintf("%d", projectID)+`/uploads/`)
+	content = strings.ReplaceAll(content, `='/uploads/`, `='/-/project/`+fmt.Sprintf("%d", projectID)+`/uploads/`)
+
+	// Fix absolute old format URLs
+	oldFormatRegex := regexp.MustCompile(regexp.QuoteMeta(baseURL) + `/uploads/([a-f0-9]+)/([^"'\s\)]+)`)
+	content = oldFormatRegex.ReplaceAllString(content, baseURL+`/-/project/`+fmt.Sprintf("%d", projectID)+`/uploads/$1/$2`)
+
+	// Now handle new format: convert relative to absolute
+	content = strings.ReplaceAll(content, `](/-/project/`, `](`+baseURL+`/-/project/`)
+	content = strings.ReplaceAll(content, `="/-/project/`, `="`+baseURL+`/-/project/`)
+	content = strings.ReplaceAll(content, `='/-/project/`, `='`+baseURL+`/-/project/`)
+
+
 	// Add a note about external dependencies for GitHub
 	if strings.Contains(content, baseURL+"/uploads/") {
 		header := fmt.Sprintf("_Note: This issue contains attachments hosted on GitLab (%s). ", baseURL)
 		header += "These files will remain accessible as long as the GitLab project exists._\n\n"
-		
+
 		// Only add the header if it's not already there
 		if !strings.Contains(content, header) {
 			content = header + content
@@ -780,4 +930,112 @@ func fixGitLabAttachmentURLs(content string, baseURL string) string {
 	}
 
 	return content
+}
+
+// detectFileExtension detects the file type from the binary content using magic bytes
+func detectFileExtension(data []byte) string {
+	if len(data) < 4 {
+		return ""
+	}
+
+	// Check for common image formats using magic bytes
+	// JPEG
+	if len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return ".jpg"
+	}
+
+	// PNG
+	if len(data) >= 8 && bytes.Equal(data[0:8], []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}) {
+		return ".png"
+	}
+
+	// GIF
+	if len(data) >= 6 && (bytes.Equal(data[0:6], []byte("GIF87a")) || bytes.Equal(data[0:6], []byte("GIF89a"))) {
+		return ".gif"
+	}
+
+	// WebP
+	if len(data) >= 12 && bytes.Equal(data[0:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")) {
+		return ".webp"
+	}
+
+	// BMP
+	if len(data) >= 2 && data[0] == 0x42 && data[1] == 0x4D {
+		return ".bmp"
+	}
+
+	// ICO
+	if len(data) >= 4 && data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x01 && data[3] == 0x00 {
+		return ".ico"
+	}
+
+	// TIFF (little-endian)
+	if len(data) >= 4 && data[0] == 0x49 && data[1] == 0x49 && data[2] == 0x2A && data[3] == 0x00 {
+		return ".tiff"
+	}
+
+	// TIFF (big-endian)
+	if len(data) >= 4 && data[0] == 0x4D && data[1] == 0x4D && data[2] == 0x00 && data[3] == 0x2A {
+		return ".tiff"
+	}
+
+	// SVG (XML-based, check for common SVG patterns)
+	if len(data) >= 50 {
+		header := string(data[:min(len(data), 200)])
+		if strings.Contains(strings.ToLower(header), "<svg") || strings.Contains(strings.ToLower(header), "<?xml") && strings.Contains(strings.ToLower(header), "svg") {
+			return ".svg"
+		}
+	}
+
+	// HEIC
+	if len(data) >= 12 && (bytes.Equal(data[4:8], []byte("ftypheic")) || bytes.Equal(data[4:8], []byte("ftypheix")) || bytes.Equal(data[4:8], []byte("ftyphevc"))) {
+		return ".heic"
+	}
+
+	// AVIF
+	if len(data) >= 12 && bytes.Equal(data[4:8], []byte("ftypavif")) {
+		return ".avif"
+	}
+
+	// PDF
+	if len(data) >= 5 && bytes.Equal(data[0:5], []byte("%PDF-")) {
+		return ".pdf"
+	}
+
+	// ZIP
+	if len(data) >= 4 && data[0] == 0x50 && data[1] == 0x4B && (data[2] == 0x03 || data[2] == 0x05 || data[2] == 0x07) && (data[3] == 0x04 || data[3] == 0x06 || data[3] == 0x08) {
+		return ".zip"
+	}
+
+	// Check for video formats
+	// MP4
+	if len(data) >= 12 && (bytes.Equal(data[4:8], []byte("ftyp")) || bytes.Equal(data[4:8], []byte("ftypmp4")) || bytes.Equal(data[4:8], []byte("ftypisom"))) {
+		return ".mp4"
+	}
+
+	// AVI
+	if len(data) >= 12 && bytes.Equal(data[0:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("AVI ")) {
+		return ".avi"
+	}
+
+	// MOV
+	if len(data) >= 8 && bytes.Equal(data[4:8], []byte("ftypqt")) {
+		return ".mov"
+	}
+
+	// WebM
+	if len(data) >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3 {
+		return ".webm"
+	}
+
+	// Default to empty string if type cannot be detected
+	return ""
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

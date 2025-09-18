@@ -86,15 +86,27 @@ func ConvertGitHubIssue(issue *github.Issue) Issue {
 }
 
 func ConvertGitLabIssue(issue *gitlab.Issue) Issue {
-	return Issue{
+	converted := Issue{
 		ID:          issue.IID,
 		Title:       issue.Title,
 		Description: issue.Description,
 		State:       issue.State,
 		Labels:      issue.Labels,
-		Author:      issue.Author.Username,
-		CreatedAt:   *issue.CreatedAt,
-		UpdatedAt:   *issue.UpdatedAt,
 		URL:         issue.WebURL,
 	}
+
+	// Handle potentially nil fields
+	if issue.Author != nil {
+		converted.Author = issue.Author.Username
+	}
+
+	if issue.CreatedAt != nil {
+		converted.CreatedAt = *issue.CreatedAt
+	}
+
+	if issue.UpdatedAt != nil {
+		converted.UpdatedAt = *issue.UpdatedAt
+	}
+
+	return converted
 }

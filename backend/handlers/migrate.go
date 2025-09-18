@@ -70,7 +70,19 @@ func migrateGitHubToGitLab(req models.MigrationRequest) models.MigrationResult {
 			labels[i] = label.GetName()
 		}
 
-		description := fmt.Sprintf("*Migrated from GitHub: %s*\n\n%s", issue.GetHTMLURL(), issue.GetBody())
+		// Create migration header with timestamp information
+		migrationHeader := fmt.Sprintf("### 🔄 Migrated from GitHub\n\n")
+		migrationHeader += fmt.Sprintf("**Original Issue:** %s\n", issue.GetHTMLURL())
+		migrationHeader += fmt.Sprintf("**Original Author:** @%s\n", issue.User.GetLogin())
+		migrationHeader += fmt.Sprintf("**Created:** %s\n", issue.GetCreatedAt().Format("2006-01-02 15:04:05 UTC"))
+		migrationHeader += fmt.Sprintf("**Last Updated:** %s\n", issue.GetUpdatedAt().Format("2006-01-02 15:04:05 UTC"))
+		if issue.GetState() == "closed" && issue.ClosedAt != nil {
+			migrationHeader += fmt.Sprintf("**Closed:** %s\n", issue.GetClosedAt().Format("2006-01-02 15:04:05 UTC"))
+		}
+		migrationHeader += fmt.Sprintf("**State:** %s\n\n", issue.GetState())
+		migrationHeader += "---\n\n"
+
+		description := migrationHeader + issue.GetBody()
 		title := issue.GetTitle()
 
 		createOpts := &gitlab.CreateIssueOptions{
@@ -91,7 +103,14 @@ func migrateGitHubToGitLab(req models.MigrationRequest) models.MigrationResult {
 		comments, _, err := ghClient.Issues.ListComments(ctx, req.Source.Owner, req.Source.Repo, issueID, nil)
 		if err == nil {
 			for _, comment := range comments {
-				body := fmt.Sprintf("**@%s commented:**\n\n%s", comment.User.GetLogin(), comment.GetBody())
+				// Include comment timestamp
+				commentHeader := fmt.Sprintf("**@%s** commented on %s",
+					comment.User.GetLogin(),
+					comment.GetCreatedAt().Format("2006-01-02 15:04:05 UTC"))
+				if comment.UpdatedAt != nil && comment.GetUpdatedAt().After(comment.GetCreatedAt().Time) {
+					commentHeader += fmt.Sprintf(" _(edited %s)_", comment.GetUpdatedAt().Format("2006-01-02 15:04:05 UTC"))
+				}
+				body := fmt.Sprintf("%s\n\n%s", commentHeader, comment.GetBody())
 				noteOpts := &gitlab.CreateIssueNoteOptions{
 					Body: &body,
 				}
@@ -130,7 +149,19 @@ func migrateGitLabToGitHub(req models.MigrationRequest) models.MigrationResult {
 			continue
 		}
 
-		body := fmt.Sprintf("*Migrated from GitLab: %s*\n\n%s", issue.WebURL, issue.Description)
+		// Create migration header with detailed timestamp information
+		migrationHeader := fmt.Sprintf("### 🔄 Migrated from GitLab\n\n")
+		migrationHeader += fmt.Sprintf("**Original Issue:** %s\n", issue.WebURL)
+		migrationHeader += fmt.Sprintf("**Original Author:** @%s\n", issue.Author.Username)
+		migrationHeader += fmt.Sprintf("**Created:** %s\n", issue.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+		migrationHeader += fmt.Sprintf("**Last Updated:** %s\n", issue.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
+		if issue.State == "closed" && issue.ClosedAt != nil {
+			migrationHeader += fmt.Sprintf("**Closed:** %s\n", issue.ClosedAt.Format("2006-01-02 15:04:05 UTC"))
+		}
+		migrationHeader += fmt.Sprintf("**State:** %s\n\n", issue.State)
+		migrationHeader += "---\n\n"
+
+		body := migrationHeader + issue.Description
 
 		labels := make([]string, len(issue.Labels))
 		for i, label := range issue.Labels {
@@ -160,7 +191,14 @@ func migrateGitLabToGitHub(req models.MigrationRequest) models.MigrationResult {
 		notes, _, err := glClient.Notes.ListIssueNotes(req.Source.ProjectID, issueID, nil)
 		if err == nil {
 			for _, note := range notes {
-				body := fmt.Sprintf("**@%s commented:**\n\n%s", note.Author.Username, note.Body)
+				// Include note timestamp
+				commentHeader := fmt.Sprintf("**@%s** commented on %s",
+					note.Author.Username,
+					note.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+				if note.UpdatedAt != nil && note.UpdatedAt.After(*note.CreatedAt) {
+					commentHeader += fmt.Sprintf(" _(edited %s)_", note.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
+				}
+				body := fmt.Sprintf("%s\n\n%s", commentHeader, note.Body)
 				comment := &github.IssueComment{
 					Body: &body,
 				}

@@ -98,7 +98,19 @@ func migrateGHtoGLFinal(req models.MigrationRequest, ginCtx *gin.Context) models
 			labels[i] = label.GetName()
 		}
 
-		description := fmt.Sprintf("*Migrated from GitHub: %s*\n\n%s", issue.GetHTMLURL(), processedBody)
+		// Create migration header with timestamp information
+		migrationHeader := fmt.Sprintf("### 🔄 Migrated from GitHub\n\n")
+		migrationHeader += fmt.Sprintf("**Original Issue:** %s\n", issue.GetHTMLURL())
+		migrationHeader += fmt.Sprintf("**Original Author:** @%s\n", issue.User.GetLogin())
+		migrationHeader += fmt.Sprintf("**Created:** %s\n", issue.GetCreatedAt().Format("2006-01-02 15:04:05 UTC"))
+		migrationHeader += fmt.Sprintf("**Last Updated:** %s\n", issue.GetUpdatedAt().Format("2006-01-02 15:04:05 UTC"))
+		if issue.GetState() == "closed" && issue.ClosedAt != nil {
+			migrationHeader += fmt.Sprintf("**Closed:** %s\n", issue.GetClosedAt().Format("2006-01-02 15:04:05 UTC"))
+		}
+		migrationHeader += fmt.Sprintf("**State:** %s\n\n", issue.GetState())
+		migrationHeader += "---\n\n"
+
+		description := migrationHeader + processedBody
 		title := issue.GetTitle()
 
 		createOpts := &gitlab.CreateIssueOptions{
@@ -133,7 +145,14 @@ func migrateGHtoGLFinal(req models.MigrationRequest, ginCtx *gin.Context) models
 					req.Target.BaseURL,
 					req.Source.Token, // Pass GitHub token for authenticated download
 				)
-				body := fmt.Sprintf("**@%s commented:**\n\n%s", comment.User.GetLogin(), processedComment)
+				// Include comment timestamp
+				commentHeader := fmt.Sprintf("**@%s** commented on %s",
+					comment.User.GetLogin(),
+					comment.GetCreatedAt().Format("2006-01-02 15:04:05 UTC"))
+				if comment.UpdatedAt != nil && comment.GetUpdatedAt().After(comment.GetCreatedAt().Time) {
+					commentHeader += fmt.Sprintf(" _(edited %s)_", comment.GetUpdatedAt().Format("2006-01-02 15:04:05 UTC"))
+				}
+				body := fmt.Sprintf("%s\n\n%s", commentHeader, processedComment)
 				noteOpts := &gitlab.CreateIssueNoteOptions{
 					Body: &body,
 				}
@@ -179,7 +198,20 @@ func migrateGLtoGHFinal(req models.MigrationRequest, ginCtx *gin.Context) models
 
 		// Fix relative URLs
 		processedBody := fixGitLabURLsFinal(issue.Description, req.Source.BaseURL)
-		body := fmt.Sprintf("*Migrated from GitLab: %s*\n\n%s", issue.WebURL, processedBody)
+
+		// Create migration header with detailed timestamp information
+		migrationHeader := fmt.Sprintf("### 🔄 Migrated from GitLab\n\n")
+		migrationHeader += fmt.Sprintf("**Original Issue:** %s\n", issue.WebURL)
+		migrationHeader += fmt.Sprintf("**Original Author:** @%s\n", issue.Author.Username)
+		migrationHeader += fmt.Sprintf("**Created:** %s\n", issue.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+		migrationHeader += fmt.Sprintf("**Last Updated:** %s\n", issue.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
+		if issue.State == "closed" && issue.ClosedAt != nil {
+			migrationHeader += fmt.Sprintf("**Closed:** %s\n", issue.ClosedAt.Format("2006-01-02 15:04:05 UTC"))
+		}
+		migrationHeader += fmt.Sprintf("**State:** %s\n\n", issue.State)
+		migrationHeader += "---\n\n"
+
+		body := migrationHeader + processedBody
 
 		labels := make([]string, len(issue.Labels))
 		for i, label := range issue.Labels {
@@ -216,7 +248,14 @@ func migrateGLtoGHFinal(req models.MigrationRequest, ginCtx *gin.Context) models
 			fmt.Printf("[MIGRATE] Processing %d notes for issue #%d\n", len(notes), issueID)
 			for _, note := range notes {
 				processedNote := fixGitLabURLsFinal(note.Body, req.Source.BaseURL)
-				body := fmt.Sprintf("**@%s commented:**\n\n%s", note.Author.Username, processedNote)
+				// Include note timestamp
+				commentHeader := fmt.Sprintf("**@%s** commented on %s",
+					note.Author.Username,
+					note.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+				if note.UpdatedAt != nil && note.UpdatedAt.After(*note.CreatedAt) {
+					commentHeader += fmt.Sprintf(" _(edited %s)_", note.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
+				}
+				body := fmt.Sprintf("%s\n\n%s", commentHeader, processedNote)
 				comment := &github.IssueComment{
 					Body: &body,
 				}
@@ -314,10 +353,19 @@ func processImagesWithLogging(content string, projectID int, token string, baseU
 	
 	for oldURL, newURL := range urlMap {
 		// Convert GitLab URL to relative format
-		// From: https://gitlab.com/uploads/xxx/filename.png
-		// To: /uploads/xxx/filename.png
+		// Handle both old and new formats:
+		// Old: https://gitlab.com/uploads/xxx/filename.png -> /uploads/xxx/filename.png
+		// New: https://gitlab.com/-/project/74006604/uploads/xxx/filename.png -> /-/project/74006604/uploads/xxx/filename.png
 		relativeURL := newURL
-		if strings.Contains(newURL, "/uploads/") {
+
+		// Check for new format first
+		if strings.Contains(newURL, "/-/project/") {
+			idx := strings.Index(newURL, "/-/project/")
+			if idx != -1 {
+				relativeURL = newURL[idx:]
+			}
+		} else if strings.Contains(newURL, "/uploads/") {
+			// Old format
 			parts := strings.Split(newURL, "/uploads/")
 			if len(parts) > 1 {
 				relativeURL = "/uploads/" + parts[1]
@@ -458,7 +506,10 @@ func uploadImageToGitLab(projectID int, imageData []byte, filename string, token
 	}
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+		if resp.StatusCode == http.StatusForbidden {
+			return "", fmt.Errorf("upload failed with status 403 Forbidden - Check that your GitLab token has 'api' scope and write access to project %d: %s", projectID, string(respBody))
+		}
+		return "", fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var uploadResult struct {
@@ -505,6 +556,11 @@ func fixGitLabURLsFinal(content string, baseURL string) string {
 		return content
 	}
 
+	// Handle new GitLab format: /-/project/{id}/uploads/...
+	content = strings.ReplaceAll(content, `](/-/project/`, `](`+baseURL+`/-/project/`)
+	content = strings.ReplaceAll(content, `="/-/project/`, `="`+baseURL+`/-/project/`)
+
+	// Also handle old format for backwards compatibility
 	content = strings.ReplaceAll(content, `](/uploads/`, `](`+baseURL+`/uploads/`)
 	content = strings.ReplaceAll(content, `="/uploads/`, `="`+baseURL+`/uploads/`)
 

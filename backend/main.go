@@ -20,6 +20,14 @@ func main() {
 	// gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
+	// Add global panic recovery middleware
+	r.Use(gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
+		fmt.Printf("[PANIC] Recovered from panic: %v\n", recovered)
+		c.JSON(500, gin.H{
+			"error": fmt.Sprintf("Internal server error: %v", recovered),
+		})
+	}))
+
 	config := cors.DefaultConfig()
 	config.AllowOrigins = []string{"http://localhost:3000"}
 	config.AllowMethods = []string{"GET", "POST", "OPTIONS"}

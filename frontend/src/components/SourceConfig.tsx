@@ -110,6 +110,21 @@ const SourceConfig: React.FC<SourceConfigProps> = ({
         </Form.Group>
       )}
 
+      {config.type === 'gitlab' && (
+        <Form.Group className="mb-3">
+          <Form.Label>Session Cookie (Optional)</Form.Label>
+          <Form.Control
+            type="password"
+            placeholder="_gitlab_session cookie value"
+            value={config.session || ''}
+            onChange={(e) => handleChange('session', e.target.value)}
+          />
+          <Form.Text className="text-muted">
+            GitLab session cookie for downloading attachments from private repos (found in browser DevTools → Application → Cookies → _gitlab_session)
+          </Form.Text>
+        </Form.Group>
+      )}
+
       {!isTarget && (
         <Button
           variant="primary"
