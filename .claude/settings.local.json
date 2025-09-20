@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(chmod:*)",
-      "Bash(go build:*)"
+      "Bash(go build:*)",
+      "Bash(docker compose:*)"
     ],
     "deny": [],
     "ask": []

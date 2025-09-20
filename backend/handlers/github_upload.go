@@ -67,13 +67,19 @@ func UploadToGitHubWithRepoAndReferer(data []byte, filename string, token string
 	// But we still need to complete the upload process
 
 	// Step 2: Upload file to S3
-	_, err = uploadToGitHubS3(policy, data, filename)
+	s3Response, err := uploadToGitHubS3(policy, data, filename)
 	if err != nil {
-		// If S3 upload fails but we have an asset URL, try to confirm it anyway
+		fmt.Printf("[ERROR] S3 upload failed: %v\n", err)
+		// If S3 upload fails and we don't have an asset URL, we can't continue
 		if policy.Asset.Href == "" {
-			return "", fmt.Errorf("failed to upload to S3: %w", err)
+			return "", fmt.Errorf("failed to upload to S3 and no asset URL available: %w", err)
 		}
-		fmt.Printf("[WARNING] S3 upload failed but continuing with asset confirmation: %v\n", err)
+		// If we have an asset URL from the policy, we might still try to use it
+		// but the file won't actually be available
+		fmt.Printf("[WARNING] S3 upload failed but policy has asset URL: %s\n", policy.Asset.Href)
+		fmt.Printf("[WARNING] File may not be accessible at this URL\n")
+	} else if s3Response != nil {
+		fmt.Printf("[SUCCESS] S3 upload completed, response URL: %s\n", s3Response.Href)
 	}
 
 	// Step 3: Confirm the asset upload with GitHub
@@ -264,20 +270,27 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 	fmt.Printf("[S3] Upload URL: %s\n", policy.UploadURL)
 	fmt.Printf("[S3] Asset already has href: %s\n", policy.Asset.Href)
 
-	// GitHub already created the asset and gave us the URL
-	// We can return it immediately if it's already uploaded
-	if policy.Asset.Href != "" {
-		fmt.Printf("[S3] Asset already uploaded, returning existing URL\n")
-		return &GitHubUploadResponse{
-			Href:         policy.Asset.Href,
-			URL:          policy.Asset.Href,
-			OriginalName: policy.Asset.OriginalName,
-		}, nil
+	// Even if GitHub provided an asset URL, we still need to upload the actual file data
+	// The asset URL is just a placeholder until the file is uploaded
+	fmt.Printf("[S3] Asset URL provided by GitHub: %s\n", policy.Asset.Href)
+
+	// Check if we have an upload URL
+	if policy.UploadURL == "" {
+		fmt.Printf("[ERROR] No upload URL provided by GitHub - policy request may have failed\n")
+		return nil, fmt.Errorf("no upload URL provided by GitHub")
 	}
+
+	fmt.Printf("[S3] Proceeding with S3 upload to: %s\n", policy.UploadURL)
 
 	// Create multipart form data exactly as shown in the curl command
 	boundary := "----WebKitFormBoundary" + generateBoundary()
 	body := &bytes.Buffer{}
+
+	// Check which fields we actually have
+	fmt.Printf("[S3] Form fields available: %d\n", len(policy.Form))
+	for key := range policy.Form {
+		fmt.Printf("[S3]   - %s\n", key)
+	}
 
 	// Define the standard order for S3 form fields
 	// Different upload types may have different fields
@@ -300,6 +313,15 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 			body.WriteString("------" + boundary + "\r\n")
 			body.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"%s\"\r\n\r\n", fieldName))
 			body.WriteString(val + "\r\n")
+
+			// Log critical fields for debugging (but truncate sensitive data)
+			if fieldName == "key" || fieldName == "Content-Type" {
+				fmt.Printf("[S3] Form field %s: %s\n", fieldName, val)
+			} else if fieldName == "X-Amz-Signature" || fieldName == "policy" {
+				if len(val) > 20 {
+					fmt.Printf("[S3] Form field %s: %s... (truncated)\n", fieldName, val[:20])
+				}
+			}
 		}
 	}
 
@@ -369,19 +391,33 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 		fmt.Printf("[S3] Upload successful (204 No Content)\n")
 		// Return the asset URL from the policy
 		if policy.Asset.Href != "" {
+			fmt.Printf("[S3] Returning asset URL from policy: %s\n", policy.Asset.Href)
 			return &GitHubUploadResponse{
 				Href:         policy.Asset.Href,
 				URL:          policy.Asset.Href,
 				OriginalName: policy.Asset.OriginalName,
 			}, nil
+		} else {
+			fmt.Printf("[WARNING] S3 upload succeeded but no asset URL available\n")
+			return nil, fmt.Errorf("upload succeeded but no asset URL available")
 		}
 	}
 
-	// GitHub returns a redirect on successful upload
+	// GitHub returns a redirect on successful upload (303 See Other or 302 Found)
 	if resp.StatusCode == http.StatusSeeOther || resp.StatusCode == http.StatusFound {
 		location := resp.Header.Get("Location")
-		fmt.Printf("[S3] Redirect to: %s\n", location)
-		if location != "" {
+		fmt.Printf("[S3] Redirect response received (status %d)\n", resp.StatusCode)
+		fmt.Printf("[S3] Redirect location: %s\n", location)
+
+		// Use the asset URL from policy if redirect location is empty
+		if location == "" && policy.Asset.Href != "" {
+			fmt.Printf("[S3] No redirect location, using asset URL from policy: %s\n", policy.Asset.Href)
+			return &GitHubUploadResponse{
+				Href:         policy.Asset.Href,
+				URL:          policy.Asset.Href,
+				OriginalName: policy.Asset.OriginalName,
+			}, nil
+		} else if location != "" {
 			return &GitHubUploadResponse{
 				Href: location,
 				URL:  location,
