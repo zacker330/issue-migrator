@@ -195,8 +195,9 @@ func migrateGLtoGHWithFiles(req models.MigrationRequest, ginCtx *gin.Context) mo
 			continue
 		}
 
-		// Try to download and re-upload GitLab attachments to GitHub
-		processedBody := processGitLabToGitHub(issue.Description, req.Source.BaseURL, req.Source.ProjectID, req.Source.Token, req.Target.Token, req.Target.Session, req.Source.Session, req.Target.Owner, req.Target.Repo)
+		// Don't process attachments yet - we need the issue number first
+		// We'll process them after creating the issue
+		processedBody := issue.Description
 
 		// Create migration header with detailed timestamp information
 		migrationHeader := fmt.Sprintf("### 🔄 Migrated from GitLab\n\n")
@@ -241,12 +242,33 @@ func migrateGLtoGHWithFiles(req models.MigrationRequest, ginCtx *gin.Context) mo
 
 		fmt.Printf("[SUCCESS] Created GitHub issue #%d for GitLab issue #%d\n", newIssue.GetNumber(), issueID)
 
+		// Now process attachments with the actual issue number
+		fmt.Printf("[MIGRATE] Processing attachments for issue #%d\n", newIssue.GetNumber())
+		processedBodyWithAttachments := processGitLabToGitHub(issue.Description, req.Source.BaseURL, req.Source.ProjectID, req.Source.Token, req.Target.Token, req.Target.Session, req.Source.Session, req.Target.Owner, req.Target.Repo, newIssue.GetNumber())
+
+		// If attachments were processed and the body changed, update the issue
+		if processedBodyWithAttachments != issue.Description {
+			fmt.Printf("[MIGRATE] Issue body changed after processing attachments, updating issue #%d\n", newIssue.GetNumber())
+			updatedBody := migrationHeader + processedBodyWithAttachments
+			updateReq := &github.IssueRequest{
+				Body: &updatedBody,
+			}
+			_, _, err = ghClient.Issues.Edit(ctx, req.Target.Owner, req.Target.Repo, newIssue.GetNumber(), updateReq)
+			if err != nil {
+				fmt.Printf("[WARNING] Failed to update issue with processed attachments: %v\n", err)
+			} else {
+				fmt.Printf("[SUCCESS] Updated issue #%d with processed attachments\n", newIssue.GetNumber())
+			}
+		} else {
+			fmt.Printf("[INFO] No attachments were processed or body didn't change for issue #%d\n", newIssue.GetNumber())
+		}
+
 		// Process notes with timestamps
 		notes, _, err := glClient.Notes.ListIssueNotes(req.Source.ProjectID, issueID, nil)
 		if err == nil {
 			fmt.Printf("[MIGRATE] Processing %d notes for issue #%d\n", len(notes), issueID)
 			for _, note := range notes {
-				processedNote := processGitLabToGitHub(note.Body, req.Source.BaseURL, req.Source.ProjectID, req.Source.Token, req.Target.Token, req.Target.Session, req.Source.Session, req.Target.Owner, req.Target.Repo)
+				processedNote := processGitLabToGitHub(note.Body, req.Source.BaseURL, req.Source.ProjectID, req.Source.Token, req.Target.Token, req.Target.Session, req.Source.Session, req.Target.Owner, req.Target.Repo, newIssue.GetNumber())
 				// Include note timestamp
 				commentHeader := fmt.Sprintf("**@%s** commented on %s",
 					note.Author.Username,
@@ -659,7 +681,7 @@ func guessExtension(url string) string {
 }
 
 // processGitLabToGitHub attempts to download GitLab files and upload to GitHub
-func processGitLabToGitHub(content string, gitlabURL string, projectID int, gitlabToken string, githubToken string, githubSession string, gitlabSession string, githubOwner string, githubRepo string) string {
+func processGitLabToGitHub(content string, gitlabURL string, projectID int, gitlabToken string, githubToken string, githubSession string, gitlabSession string, githubOwner string, githubRepo string, issueNumber int) string {
 	if content == "" {
 		return content
 	}
@@ -676,11 +698,17 @@ func processGitLabToGitHub(content string, gitlabURL string, projectID int, gitl
 
 	fmt.Printf("[ATTACH] Found %d GitLab attachments to process\n", len(attachments))
 
-	urlMap := make(map[string]string)
+	// Store URL mappings with associated metadata
+	type UploadedFile struct {
+		NewURL   string
+		Filename string
+		IsImage  bool
+	}
+	uploadedFiles := make(map[string]UploadedFile)
 	client := &http.Client{}
 
 	for _, attachment := range attachments {
-		fmt.Printf("[ATTACH] Processing GitLab attachment11111: %s\n", attachment.URL)
+		fmt.Printf("[ATTACH] Processing GitLab attachment: %s\n", attachment.URL)
 
 		// Download from GitLab
 		req, err := http.NewRequest("GET", attachment.URL, nil)
@@ -775,7 +803,15 @@ func processGitLabToGitHub(content string, gitlabURL string, projectID int, gitl
 			}
 		}
 
-		githubURL, err := UploadToGitHubWithRepo(data, filename, githubToken, githubSession, repoID)
+		// Build the referer URL using the actual issue URL
+		var refererURL string
+		if issueNumber > 0 {
+			refererURL = fmt.Sprintf("https://github.com/%s/%s/issues/%d", githubOwner, githubRepo, issueNumber)
+		} else {
+			// Fallback to issues page if no issue number available
+			refererURL = fmt.Sprintf("https://github.com/%s/%s/issues", githubOwner, githubRepo)
+		}
+		githubURL, err := UploadToGitHubWithRepoAndReferer(data, filename, githubToken, githubSession, repoID, refererURL)
 		if err != nil {
 			fmt.Printf("[WARNING] GitHub upload failed: %v\n", err)
 
@@ -806,13 +842,89 @@ func processGitLabToGitHub(content string, gitlabURL string, projectID int, gitl
 		}
 
 		fmt.Printf("[SUCCESS] Uploaded to GitHub: %s\n", githubURL)
-		urlMap[attachment.URL] = githubURL
+		fmt.Printf("[SUCCESS] Original URL: %s\n", attachment.URL)
+		fmt.Printf("[SUCCESS] Original filename: %s\n", filename)
+
+		// Determine if this is an image based on the filename
+		isImg := isImageURL(filename) || isImageURL(githubURL)
+
+		// Store the mapping with metadata for proper formatting
+		uploadedFiles[attachment.URL] = UploadedFile{
+			NewURL:   githubURL,
+			Filename: filename,
+			IsImage:  isImg,
+		}
 	}
 
-	// Replace successful uploads
+	// Replace successful uploads with proper formatting
 	result := content
-	for oldURL, newURL := range urlMap {
-		result = strings.ReplaceAll(result, oldURL, newURL)
+	fmt.Printf("[ATTACH] Replacing %d URLs in content with proper formatting\n", len(uploadedFiles))
+
+	// Process each attachment replacement
+	for oldURL, fileInfo := range uploadedFiles {
+		// Find all occurrences of this URL in the content
+		// We need to check the context to determine how it's currently formatted
+
+		// Pattern 1: Markdown images ![alt](url)
+		imagePattern := regexp.MustCompile(`!\[([^\]]*)\]\(` + regexp.QuoteMeta(oldURL) + `\)`)
+		result = imagePattern.ReplaceAllString(result, `![$1](`+fileInfo.NewURL+`)`)
+
+		// Pattern 2: Markdown links [text](url)
+		linkPattern := regexp.MustCompile(`\[([^\]]+)\]\(` + regexp.QuoteMeta(oldURL) + `\)`)
+		matches := linkPattern.FindAllStringSubmatch(result, -1)
+		for _, match := range matches {
+			if len(match) > 1 {
+				linkText := match[1]
+				// Keep the original link text
+				result = strings.ReplaceAll(result, match[0], fmt.Sprintf("[%s](%s)", linkText, fileInfo.NewURL))
+			}
+		}
+
+		// Pattern 3: HTML img tags
+		imgTagPattern := regexp.MustCompile(`<img[^>]*\ssrc=["']` + regexp.QuoteMeta(oldURL) + `["'][^>]*>`)
+		imgMatches := imgTagPattern.FindAllString(result, -1)
+		for _, match := range imgMatches {
+			// Extract alt text if available
+			altRegex := regexp.MustCompile(`alt=["']([^"']*)["']`)
+			altMatch := altRegex.FindStringSubmatch(match)
+			altText := "Image"
+			if len(altMatch) > 1 && altMatch[1] != "" {
+				altText = altMatch[1]
+			}
+			// Replace with markdown image syntax
+			result = strings.ReplaceAll(result, match, fmt.Sprintf("![%s](%s)", altText, fileInfo.NewURL))
+		}
+
+		// Pattern 4: Plain URLs that haven't been replaced yet
+		// This catches any remaining instances
+		remainingCount := strings.Count(result, oldURL)
+		if remainingCount > 0 {
+			// For plain URLs, wrap them in appropriate markdown based on file type
+			if fileInfo.IsImage {
+				// Replace with markdown image syntax
+				altText := "Image"
+				if fileInfo.Filename != "" && fileInfo.Filename != "image" {
+					altText = fileInfo.Filename
+				}
+				result = strings.ReplaceAll(result, oldURL, fmt.Sprintf("![%s](%s)", altText, fileInfo.NewURL))
+			} else {
+				// Replace with markdown link syntax using filename
+				linkText := fileInfo.Filename
+				if linkText == "" || linkText == "attachment" {
+					linkText = "Download File"
+				}
+				result = strings.ReplaceAll(result, oldURL, fmt.Sprintf("[%s](%s)", linkText, fileInfo.NewURL))
+			}
+		}
+
+		fmt.Printf("[ATTACH] Processed replacement for %s -> %s (image: %v)\n", oldURL, fileInfo.NewURL, fileInfo.IsImage)
+	}
+
+	// Log if content changed
+	if result != content {
+		fmt.Printf("[ATTACH] Content was modified with new URLs\n")
+	} else {
+		fmt.Printf("[ATTACH] WARNING: Content was NOT modified - URLs may not have been replaced\n")
 	}
 
 	return result
@@ -916,7 +1028,6 @@ func fixGitLabAttachmentURLs(content string, baseURL string, projectID int) stri
 	content = strings.ReplaceAll(content, `](/-/project/`, `](`+baseURL+`/-/project/`)
 	content = strings.ReplaceAll(content, `="/-/project/`, `="`+baseURL+`/-/project/`)
 	content = strings.ReplaceAll(content, `='/-/project/`, `='`+baseURL+`/-/project/`)
-
 
 	// Add a note about external dependencies for GitHub
 	if strings.Contains(content, baseURL+"/uploads/") {
@@ -1038,4 +1149,63 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// isImageURL checks if a URL points to an image file
+func isImageURL(url string) bool {
+	lowerURL := strings.ToLower(url)
+	imageExts := []string{".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".tiff", ".tif", ".heic", ".heif", ".avif"}
+	for _, ext := range imageExts {
+		if strings.Contains(lowerURL, ext) {
+			return true
+		}
+	}
+	// Check for GitHub's asset URLs that might be images
+	if strings.Contains(url, "github.com/user-attachments/assets") {
+		// GitHub asset URLs don't always have extensions, but we can check common patterns
+		// This is a heuristic approach
+		return true // Assume it's an image by default for GitHub assets
+	}
+	return false
+}
+
+// isFileAttachmentLink checks if a link text indicates a file attachment
+func isFileAttachmentLink(linkText, url string) bool {
+	// Check if the link text looks like a filename
+	lowerText := strings.ToLower(linkText)
+	fileExts := []string{
+		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+		".zip", ".tar", ".gz", ".rar", ".7z", ".txt", ".csv", ".log",
+		".json", ".xml", ".yaml", ".yml", ".md",
+	}
+	for _, ext := range fileExts {
+		if strings.Contains(lowerText, ext) {
+			return true
+		}
+	}
+	// Check URL as well
+	return isFileURL(url) && !isImageURL(url)
+}
+
+// getFilenameFromURL extracts filename from a URL
+func getFilenameFromURL(url string) string {
+	// For GitHub asset URLs, try to extract from the URL structure
+	if strings.Contains(url, "github.com/user-attachments/assets") {
+		// GitHub asset URLs are in format: https://github.com/user-attachments/assets/{hash}
+		// The original filename is not in the URL, so we return empty
+		return ""
+	}
+	// For other URLs, get the last part of the path
+	cleanURL := url
+	if idx := strings.Index(url, "?"); idx != -1 {
+		cleanURL = url[:idx]
+	}
+	parts := strings.Split(cleanURL, "/")
+	if len(parts) > 0 {
+		filename := parts[len(parts)-1]
+		if filename != "" && filename != "." {
+			return filename
+		}
+	}
+	return ""
 }

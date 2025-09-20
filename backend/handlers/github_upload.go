@@ -16,9 +16,9 @@ import (
 
 // GitHubUploadPolicy represents the response from GitHub's upload policy endpoint
 type GitHubUploadPolicy struct {
-	UploadURL                   string            `json:"upload_url"`
-	Header                      map[string]string `json:"header"`
-	Asset                       struct {
+	UploadURL string            `json:"upload_url"`
+	Header    map[string]string `json:"header"`
+	Asset     struct {
 		ID           int    `json:"id"`
 		Name         string `json:"name"`
 		Size         int    `json:"size"`
@@ -26,18 +26,21 @@ type GitHubUploadPolicy struct {
 		Href         string `json:"href"`
 		OriginalName string `json:"original_name"`
 	} `json:"asset"`
-	Form                        map[string]string `json:"form"`
-	SameOrigin                  bool              `json:"same_origin"`
-	AssetUploadURL              string            `json:"asset_upload_url"`
-	UploadAuthenticityToken     string            `json:"upload_authenticity_token"`
-	AssetUploadAuthenticityToken string           `json:"asset_upload_authenticity_token"`
+	// Form can contain different fields depending on the upload type
+	// For issue attachments: includes Cache-Control and x-amz-meta-Surrogate-Control
+	// For repository files: only includes basic S3 fields
+	Form                         map[string]string `json:"form"`
+	SameOrigin                   bool              `json:"same_origin"`
+	AssetUploadURL               string            `json:"asset_upload_url"`
+	UploadAuthenticityToken      string            `json:"upload_authenticity_token"`
+	AssetUploadAuthenticityToken string            `json:"asset_upload_authenticity_token"`
 }
 
 // GitHubUploadResponse represents the response after uploading
 type GitHubUploadResponse struct {
-	ID          string `json:"id"`
-	URL         string `json:"url"`
-	Href        string `json:"href"`
+	ID           string `json:"id"`
+	URL          string `json:"url"`
+	Href         string `json:"href"`
 	OriginalName string `json:"original_name"`
 }
 
@@ -49,26 +52,52 @@ func UploadToGitHub(data []byte, filename string, token string, session string) 
 
 // UploadToGitHubWithRepo uploads a file to GitHub with a specific repository ID
 func UploadToGitHubWithRepo(data []byte, filename string, token string, session string, repositoryID string) (string, error) {
+	return UploadToGitHubWithRepoAndReferer(data, filename, token, session, repositoryID, "")
+}
+
+// UploadToGitHubWithRepoAndReferer uploads a file to GitHub with a specific repository ID and referer URL
+func UploadToGitHubWithRepoAndReferer(data []byte, filename string, token string, session string, repositoryID string, refererURL string) (string, error) {
 	// Step 1: Get upload policy
 	policy, err := getGitHubUploadPolicy(filename, len(data), token, session, repositoryID)
 	if err != nil {
 		return "", fmt.Errorf("failed to get upload policy: %w", err)
 	}
 
-	// Check if GitHub already provided the asset URL (sometimes happens for small files)
+	// Sometimes GitHub returns the asset URL immediately for small files
+	// But we still need to complete the upload process
+
+	// Step 2: Upload file to S3
+	_, err = uploadToGitHubS3(policy, data, filename)
+	if err != nil {
+		// If S3 upload fails but we have an asset URL, try to confirm it anyway
+		if policy.Asset.Href == "" {
+			return "", fmt.Errorf("failed to upload to S3: %w", err)
+		}
+		fmt.Printf("[WARNING] S3 upload failed but continuing with asset confirmation: %v\n", err)
+	}
+
+	// Step 3: Confirm the asset upload with GitHub
+	if policy.Asset.ID > 0 {
+		// Use the provided referer URL or default to GitHub root
+		if refererURL == "" {
+			refererURL = "https://github.com/"
+		}
+		err = confirmGitHubAssetUpload(policy.Asset.ID, policy.AssetUploadAuthenticityToken, session, refererURL)
+		if err != nil {
+			fmt.Printf("[WARNING] Failed to confirm asset upload: %v\n", err)
+			// Continue anyway as the upload might still work
+		}
+	}
+
+	// Return the GitHub asset URL with metadata embedded for proper formatting
 	if policy.Asset.Href != "" {
-		fmt.Printf("[UPLOAD] GitHub already created asset, using URL: %s\n", policy.Asset.Href)
+		// Log the original filename for debugging
+		fmt.Printf("[UPLOAD] Asset uploaded with original filename: %s\n", filename)
+		fmt.Printf("[UPLOAD] Asset URL: %s\n", policy.Asset.Href)
 		return policy.Asset.Href, nil
 	}
 
-	// Step 2: Upload file to S3 if needed
-	uploadedAsset, err := uploadToGitHubS3(policy, data, filename)
-	if err != nil {
-		return "", fmt.Errorf("failed to upload to S3: %w", err)
-	}
-
-	// Step 3: Return the GitHub asset URL
-	return uploadedAsset.Href, nil
+	return "", fmt.Errorf("upload completed but no asset URL received")
 }
 
 // getGitHubUploadPolicy gets the upload policy from GitHub
@@ -215,6 +244,17 @@ func getGitHubUploadPolicy(filename string, size int, token string, session stri
 	fmt.Printf("[UPLOAD]   - Upload URL: %s\n", policy.UploadURL)
 	fmt.Printf("[UPLOAD]   - Form fields: %d\n", len(policy.Form))
 
+	// Log form fields for debugging
+	fmt.Printf("[UPLOAD] Form fields received:\n")
+	for key, value := range policy.Form {
+		// Truncate long values for readability
+		displayValue := value
+		if len(value) > 50 {
+			displayValue = value[:50] + "..."
+		}
+		fmt.Printf("[UPLOAD]     - %s: %s\n", key, displayValue)
+	}
+
 	return &policy, nil
 }
 
@@ -229,8 +269,8 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 	if policy.Asset.Href != "" {
 		fmt.Printf("[S3] Asset already uploaded, returning existing URL\n")
 		return &GitHubUploadResponse{
-			Href: policy.Asset.Href,
-			URL:  policy.Asset.Href,
+			Href:         policy.Asset.Href,
+			URL:          policy.Asset.Href,
 			OriginalName: policy.Asset.OriginalName,
 		}, nil
 	}
@@ -239,76 +279,35 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 	boundary := "----WebKitFormBoundary" + generateBoundary()
 	body := &bytes.Buffer{}
 
-	// Write form fields in exact order from curl command
-	// 1. key
-	if val, ok := policy.Form["key"]; ok {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"key\"\r\n\r\n")
-		body.WriteString(val + "\r\n")
+	// Define the standard order for S3 form fields
+	// Different upload types may have different fields
+	standardFields := []string{
+		"key",
+		"acl",
+		"policy",
+		"X-Amz-Algorithm",
+		"X-Amz-Credential",
+		"X-Amz-Date",
+		"X-Amz-Signature",
+		"Content-Type",
+		"Cache-Control",
+		"x-amz-meta-Surrogate-Control",
 	}
 
-	// 2. acl
-	if val, ok := policy.Form["acl"]; ok {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"acl\"\r\n\r\n")
-		body.WriteString(val + "\r\n")
+	// Add all fields in the standard order if they exist
+	for _, fieldName := range standardFields {
+		if val, ok := policy.Form[fieldName]; ok {
+			body.WriteString("------" + boundary + "\r\n")
+			body.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"%s\"\r\n\r\n", fieldName))
+			body.WriteString(val + "\r\n")
+		}
 	}
 
-	// 3. policy
-	if val, ok := policy.Form["policy"]; ok {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"policy\"\r\n\r\n")
-		body.WriteString(val + "\r\n")
-	}
-
-	// 4. X-Amz-Algorithm
-	if val, ok := policy.Form["X-Amz-Algorithm"]; ok {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"X-Amz-Algorithm\"\r\n\r\n")
-		body.WriteString(val + "\r\n")
-	}
-
-	// 5. X-Amz-Credential
-	if val, ok := policy.Form["X-Amz-Credential"]; ok {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"X-Amz-Credential\"\r\n\r\n")
-		body.WriteString(val + "\r\n")
-	}
-
-	// 6. X-Amz-Date
-	if val, ok := policy.Form["X-Amz-Date"]; ok {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"X-Amz-Date\"\r\n\r\n")
-		body.WriteString(val + "\r\n")
-	}
-
-	// 7. X-Amz-Signature
-	if val, ok := policy.Form["X-Amz-Signature"]; ok {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"X-Amz-Signature\"\r\n\r\n")
-		body.WriteString(val + "\r\n")
-	}
-
-	// 8. Content-Type
+	// Get content type from form fields
 	contentType := policy.Form["Content-Type"]
-	if contentType != "" {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"Content-Type\"\r\n\r\n")
-		body.WriteString(contentType + "\r\n")
-	}
-
-	// 9. Cache-Control
-	if val, ok := policy.Form["Cache-Control"]; ok {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"Cache-Control\"\r\n\r\n")
-		body.WriteString(val + "\r\n")
-	}
-
-	// 10. x-amz-meta-Surrogate-Control
-	if val, ok := policy.Form["x-amz-meta-Surrogate-Control"]; ok {
-		body.WriteString("------" + boundary + "\r\n")
-		body.WriteString("Content-Disposition: form-data; name=\"x-amz-meta-Surrogate-Control\"\r\n\r\n")
-		body.WriteString(val + "\r\n")
+	if contentType == "" {
+		// Fallback to detecting from filename if not in form
+		contentType = getContentType(filename)
 	}
 
 	// 11. File (last)
@@ -371,8 +370,8 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 		// Return the asset URL from the policy
 		if policy.Asset.Href != "" {
 			return &GitHubUploadResponse{
-				Href: policy.Asset.Href,
-				URL:  policy.Asset.Href,
+				Href:         policy.Asset.Href,
+				URL:          policy.Asset.Href,
 				OriginalName: policy.Asset.OriginalName,
 			}, nil
 		}
@@ -402,6 +401,122 @@ func uploadToGitHubS3(policy *GitHubUploadPolicy, data []byte, filename string) 
 	fmt.Printf("[S3] Response body: %s\n", string(responseBody))
 
 	return nil, fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(responseBody))
+}
+
+// confirmGitHubAssetUpload confirms the asset upload with GitHub
+func confirmGitHubAssetUpload(assetID int, authenticityToken string, session string, refererURL string) error {
+	// Use the correct endpoint for asset confirmation - repository-files endpoint
+	url := fmt.Sprintf("https://github.com/upload/repository-files/%d", assetID)
+
+	fmt.Printf("[CONFIRM] Confirming asset upload for ID: %d\n", assetID)
+	fmt.Printf("[CONFIRM] Using URL: %s\n", url)
+	fmt.Printf("[CONFIRM] Using referer: %s\n", refererURL)
+
+	// Log authenticity token safely
+	if len(authenticityToken) > 20 {
+		fmt.Printf("[CONFIRM] Authenticity token: %s...\n", authenticityToken[:20])
+	} else {
+		fmt.Printf("[CONFIRM] Authenticity token length: %d\n", len(authenticityToken))
+	}
+
+	// Create multipart form data with authenticity token
+	boundary := "----WebKitFormBoundary" + generateBoundary()
+	body := &bytes.Buffer{}
+
+	// Add authenticity token
+	body.WriteString("------" + boundary + "\r\n")
+	body.WriteString("Content-Disposition: form-data; name=\"authenticity_token\"\r\n\r\n")
+	body.WriteString(authenticityToken + "\r\n")
+	body.WriteString("------" + boundary + "--\r\n")
+
+	req, err := http.NewRequest("PUT", url, body)
+	if err != nil {
+		return fmt.Errorf("failed to create confirm request: %w", err)
+	}
+
+	// Set headers exactly as in the curl command
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Content-Type", fmt.Sprintf("multipart/form-data; boundary=----%s", boundary))
+	req.Header.Set("Origin", "https://github.com")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Priority", "u=1, i")
+	req.Header.Set("Referer", refererURL)
+	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("x-github-client-version", "470543cfe11ca9768bc6453923bfd6aa1a3adf6b")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+	// Generate a nonce
+	nonce := fmt.Sprintf("v2:%s", generateNonce())
+	req.Header.Set("X-Fetch-Nonce", nonce)
+
+	// Set GitHub client version (this might be important)
+	req.Header.Set("X-Github-Client-Version", "4414191ff04d0af5c0143d435276147f92c9264f")
+
+	// Add session cookie
+	if session != "" {
+		cookieHeader := fmt.Sprintf("user_session=%s; __Host-user_session_same_site=%s; logged_in=yes", session, session)
+		req.Header.Set("Cookie", cookieHeader)
+		fmt.Printf("[CONFIRM] Using session cookie for confirmation\n")
+	} else {
+		fmt.Printf("[WARNING] No session cookie for asset confirmation - this will likely fail\n")
+		return fmt.Errorf("session cookie required for asset confirmation")
+	}
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	fmt.Printf("[CONFIRM] Sending PUT request to: %s\n", url)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("confirm request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	fmt.Printf("[CONFIRM] Response status: %d\n", resp.StatusCode)
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// Check for success (usually 200 or 204)
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+		fmt.Printf("[CONFIRM] Asset upload confirmed successfully\n")
+		return nil
+	}
+
+	// Log response for debugging
+	fmt.Printf("[CONFIRM] Response body: %s\n", string(respBody))
+	fmt.Printf("[CONFIRM] Response headers: %v\n", resp.Header)
+
+	// Parse JSON error response if available
+	var errorResp map[string]interface{}
+	if err := json.Unmarshal(respBody, &errorResp); err == nil {
+		fmt.Printf("[CONFIRM] Parsed error response: %+v\n", errorResp)
+		if msg, ok := errorResp["message"].(string); ok {
+			// Check for specific error messages
+			if strings.Contains(msg, "Invalid Asset") {
+				fmt.Printf("[CONFIRM] Asset may have already been confirmed or is invalid\n")
+				// Don't fail on "Invalid Asset" - the upload might still work
+				return nil
+			}
+			return fmt.Errorf("confirmation failed: %s", msg)
+		}
+	}
+
+	// If status is 422 (Unprocessable Entity), it might mean the asset is already confirmed
+	if resp.StatusCode == 422 {
+		fmt.Printf("[CONFIRM] Got 422 status - asset may already be confirmed\n")
+		return nil
+	}
+
+	return fmt.Errorf("confirmation failed with status %d: %s", resp.StatusCode, string(respBody))
 }
 
 // getContentType returns the MIME type for a file
@@ -502,7 +617,7 @@ func generateNonce() string {
 func UploadFileToGitHubWithAuth(data []byte, filename string, owner string, repo string, token string, session string) (string, error) {
 	// Alternative approach: Use the GitHub API v3 to create a blob and tree
 	// This is more complex but might work better
-	
+
 	// First, try the browser API approach with session
 	url, err := UploadToGitHub(data, filename, token, session)
 	if err == nil {
@@ -512,7 +627,7 @@ func UploadFileToGitHubWithAuth(data []byte, filename string, owner string, repo
 	// Fallback: Create a gist or use releases API
 	fmt.Printf("[WARNING] Browser API upload failed: %v\n", err)
 	fmt.Printf("[INFO] Files will remain on original platform\n")
-	
+
 	return "", fmt.Errorf("GitHub upload not available via API")
 }
 
@@ -531,7 +646,7 @@ func (g *GitHubAuthenticatedUpload) UploadAttachment(data []byte, filename strin
 	// 2. Get CSRF tokens if needed
 	// 3. Upload to the correct endpoint
 	// 4. Return the attachment URL
-	
+
 	// For now, we'll return an error indicating this needs browser automation
 	return "", fmt.Errorf("GitHub file upload requires browser session authentication")
 }
@@ -540,7 +655,7 @@ func (g *GitHubAuthenticatedUpload) UploadAttachment(data []byte, filename strin
 // 1. Valid session cookies (not just API token)
 // 2. CSRF tokens
 // 3. Specific headers that match browser behavior
-// 
+//
 // For production use, consider:
 // - Using GitHub Actions to upload files
 // - Creating a GitHub App with proper permissions
